@@ -76,7 +76,7 @@ def _image_components(event: AstrMessageEvent) -> List[Image]:
     PLUGIN_NAME,
     "娜莉灵",
     "一条指令，把机器人会的一切画成一张暗色科幻风图鉴。群里@一下就发图；背景、Logo、配色想换就换，发张图发条指令秒生效，不用碰文件不用重启",
-    "0.1.0",
+    "0.2.0",
 )
 class HelpDexPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):

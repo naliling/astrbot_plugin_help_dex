@@ -148,6 +148,19 @@ class HelpImageRenderer:
         radius = min(radius, (x2 - x1) // 2, (y2 - y1) // 2)
         draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=width)
 
+    def _blend_rounded_rect(self, base, xy, radius, fill=None, outline=None, width=1):
+        # ImageDraw 的半透明填充是直接覆盖像素而非混合，最后转 RGB 时 alpha 又被丢弃，
+        # 导致“透明度没生效”。半透明形状统一画到透明层再 alpha_composite 回去。
+        fill_alpha = fill[3] if fill and len(fill) == 4 else 255
+        outline_alpha = outline[3] if outline and len(outline) == 4 else 255
+        if fill_alpha >= 255 and outline_alpha >= 255:
+            self._rounded_rect(ImageDraw.Draw(base), xy, radius, fill=fill, outline=outline, width=width)
+            return
+        layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        layer_draw = ImageDraw.Draw(layer)
+        self._rounded_rect(layer_draw, xy, radius, fill=fill, outline=outline, width=width)
+        base.alpha_composite(layer)
+
     # -------------------- 布局 --------------------
     def _header_height(self) -> int:
         title_h = self._text_size(self.title_text, self.font_title)[1]
@@ -252,11 +265,14 @@ class HelpImageRenderer:
             t = row / max(height - 1, 1)
             color = tuple(int(start[i] + (end[i] - start[i]) * t) for i in range(3))
             draw.line([(0, row), (WIDTH, row)], fill=color)
-        # 极淡的网格纹理，加一层科技底噪
+        # 极淡的网格纹理：画到透明层再合成，低透明度才会真正生效
+        grid = Image.new("RGBA", (WIDTH, height), (0, 0, 0, 0))
+        grid_draw = ImageDraw.Draw(grid)
         for gx in range(0, WIDTH, GRID_STEP):
-            draw.line([(gx, 0), (gx, height)], fill=GRID_COLOR)
+            grid_draw.line([(gx, 0), (gx, height)], fill=GRID_COLOR)
         for gy in range(0, height, GRID_STEP):
-            draw.line([(0, gy), (WIDTH, gy)], fill=GRID_COLOR)
+            grid_draw.line([(0, gy), (WIDTH, gy)], fill=GRID_COLOR)
+        canvas.alpha_composite(grid)
         return canvas
 
     def _card_fill(self) -> Tuple[int, int, int, int]:
@@ -316,8 +332,8 @@ class HelpImageRenderer:
             backing_right = text_x + max(title_w, subtitle_w) + 14
             if self.logo:
                 backing_right = min(backing_right, WIDTH - PADDING - self.logo.size[0] - 12)
-            self._rounded_rect(
-                draw,
+            self._blend_rounded_rect(
+                img,
                 (PADDING - 6, text_top - 8, backing_right, text_top + text_block + 8),
                 radius=12,
                 fill=chip_fill,
@@ -337,10 +353,15 @@ class HelpImageRenderer:
         # 标题区下方的发光细线：中间亮、两端渐隐
         divider_y = PADDING + header_block + HEADER_GAP // 2
         half = WIDTH / 2 - PADDING
+        divider = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        divider_draw = ImageDraw.Draw(divider)
         for x in range(PADDING, WIDTH - PADDING):
             t = abs((x - WIDTH / 2) / half)
             alpha = int(150 * (1 - t) ** 2 + 20)
-            draw.point((x, divider_y), fill=(accent_rgba[0], accent_rgba[1], accent_rgba[2], alpha))
+            divider_draw.point(
+                (x, divider_y), fill=(accent_rgba[0], accent_rgba[1], accent_rgba[2], alpha)
+            )
+        img.alpha_composite(divider)
 
         # 区块与面板
         section_color = self.style.get_color("区块")[:3]
@@ -352,8 +373,8 @@ class HelpImageRenderer:
             if op["op"] == "section":
                 if has_bg:
                     tw = self._text_size(op["name"], self.font_section)[0]
-                    self._rounded_rect(
-                        draw,
+                    self._blend_rounded_rect(
+                        img,
                         (
                             PADDING - 6,
                             op["y"] - 5,
@@ -395,8 +416,8 @@ class HelpImageRenderer:
                 row_h = op["row_heights"][row_index]
                 for col_index, cell in enumerate(row):
                     cell_x = PADDING + PANEL_PAD_X + col_index * (cell_w + CELL_GAP)
-                    self._rounded_rect(
-                        draw,
+                    self._blend_rounded_rect(
+                        img,
                         (cell_x, cell_y, cell_x + cell_w, cell_y + row_h),
                         radius=CELL_RADIUS,
                         fill=card_fill,
@@ -429,8 +450,8 @@ class HelpImageRenderer:
         fw = self._text_size(footer_text, self.font_footer)[0]
         fx = (WIDTH - fw) // 2
         fy = total_height - FOOTER_HEIGHT + 14
-        self._rounded_rect(
-            draw,
+        self._blend_rounded_rect(
+            img,
             (fx - 16, fy - 6, fx + fw + 16, fy + self._text_size(footer_text, self.font_footer)[1] + 8),
             radius=10,
             fill=chip_fill,
