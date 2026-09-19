@@ -1,0 +1,58 @@
+{
+    "title_help": {
+        "description": "图鉴标题",
+        "hint": "显示在帮助图顶部的大标题，也可用指令 /图鉴标题 临时修改",
+        "type": "string",
+        "default": "指令图鉴"
+    },
+    "title_desc": {
+        "description": "图鉴简介",
+        "hint": "标题下面那行小字，也可用指令 /图鉴简介 临时修改",
+        "type": "string",
+        "default": "这里收录了我会的所有指令"
+    },
+    "show_builtin_cmds": {
+        "description": "显示 AstrBot 内置指令",
+        "hint": "关闭后帮助图里不再列出 AstrBot 原生自带指令",
+        "type": "bool",
+        "default": true
+    },
+    "show_all_cmds": {
+        "description": "显示管理员指令",
+        "hint": "开启后会显示仅管理员可用的指令，需要时再开。每条指令的权限可在 Dashboard 的插件管理里调整。",
+        "type": "bool",
+        "default": false
+    },
+    "card_opacity": {
+        "description": "卡片不透明度",
+        "hint": "20～100，数值越低卡片越透明、背景（渐变或背景图）越明显；觉得文字看不清就调高，默认 80",
+        "type": "int",
+        "default": 80
+    },
+    "grid_columns": {
+        "description": "每行指令数",
+        "hint": "指令卡片的分栏数量，1～4 栏；栏数越多图片越短，默认 3",
+        "type": "int",
+        "default": 3
+    },
+    "custom_cmds": {
+        "description": "自定义额外指令",
+        "hint": "正则或监听器形成的指令收集不到，可在这里补充，格式为「命令:描述」",
+        "type": "list",
+        "default": []
+    },
+    "plugin_display_names": {
+        "description": "插件显示名称",
+        "hint": "部分插件没有外显名称时用这里的中文名，格式为「插件名:显示名称」",
+        "type": "list",
+        "default": [
+            "builtin_commands:内置指令"
+        ]
+    },
+    "plugin_blacklist": {
+        "description": "插件黑名单",
+        "hint": "填插件名（区分大小写），黑名单里的插件不出现在图鉴里",
+        "type": "list",
+        "default": []
+    }
+}

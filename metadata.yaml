@@ -1,0 +1,7 @@
+name: help_dex
+display_name: help_dex（指令渲染）
+desc: 一条指令，把机器人会的一切画成一张暗色科幻风图鉴。群里@一下就发图；可自定义背景、Logo、配色想换就换，发张图发条指令秒生效，不用碰文件不用重启——给你的机器人一张拿得出手的名片
+version: 0.1.0
+author: 娜莉灵
+repo: https://github.com/naliling/astrbot_plugin_help_dex
+astrbot_version: ">=4.17.0"
