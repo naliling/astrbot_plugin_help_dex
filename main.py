@@ -182,30 +182,51 @@ class HelpDexPlugin(Star):
             raw = str(getattr(self.config, "public_base_url", "") or "").strip()
             if raw:
                 logger.error("[help_dex] " + LOOPBACK_HINT)
-        await self._restore_named_tunnel(port)
+        await self._restore_tunnel(port)
 
-    async def _restore_named_tunnel(self, port: int) -> None:
-        """具名隧道在启动时自动拉起——「固定地址」的前提是重启不丢。
+    async def _restore_tunnel(self, port: int) -> None:
+        """启动时把隧道拉回来——不然每次重启都必然「对外地址不可用」。
 
-        临时隧道不自动拉：它本来重启就变，而且擅自把服务开到公网
-        属于有安全影响的操作，不能因为插件加载就发生。
+        具名隧道优先：地址固定。
+        配的是临时地址就退而求其次，自动重开一个临时隧道——
+        **地址会变**，但至少入群时发出去的那条是能点开的，
+        总好过配置里躺着一个早就失效的地址、发出去就是死链。
         """
-        hostname = TunnelManager.named_hostname()
-        if not hostname or not TunnelManager.is_available():
+        if not TunnelManager.is_available():
             return
         if not bool(getattr(self.config, "tunnel_autostart", True)):
-            logger.info("[help_dex] 已配固定隧道，但 tunnel_autostart 是关的，不自动拉起")
+            logger.info("[help_dex] tunnel_autostart 是关的，启动时不自动拉隧道")
             return
-        try:
-            url = await self._tunnel.start_named(port)
-        except Exception as exc:
-            logger.warning(f"[help_dex] 固定隧道自动拉起失败：{exc}")
+        raw = str(getattr(self.config, "public_base_url", "") or "").strip()
+        if not self._base_url():
+            return                      # 没填地址，或填的是回环/内网
+        if TunnelManager.named_hostname():
+            logger.info("[help_dex] 检测到固定隧道配置，正在恢复…")
+            try:
+                url = await self._tunnel.start_named(port)
+            except Exception as exc:
+                logger.warning(f"[help_dex] 固定隧道自动拉起失败：{exc}")
+                return
+            logger.info(f"[help_dex] 固定隧道已恢复：{url}（地址永久不变）")
+        elif raw.endswith(".trycloudflare.com"):
+            logger.info("[help_dex] 检测到临时地址配置，正在自动重开临时隧道…")
+            try:
+                url = await self._tunnel.start_quick(port)
+            except Exception as exc:
+                logger.warning(f"[help_dex] 临时隧道自动拉起失败：{exc}")
+                return
+            if url != raw:
+                logger.info(
+                    f"[help_dex] 临时隧道地址已变：{raw} → {url}（临时地址本来就会变）"
+                )
+            logger.info(f"[help_dex] 临时隧道已恢复：{url}")
+        else:
+            logger.info("[help_dex] 对外地址不是 tunnel 域名，请自行确认反代指向本机端口")
             return
         self.config["public_base_url"] = url
         self._save_config()
         self._probe_ok = None
         self._probed_at = 0.0
-        logger.info(f"[help_dex] 固定隧道已自动恢复：{url}")
 
     async def terminate(self) -> None:
         if self._poller is not None:
@@ -601,11 +622,12 @@ class HelpDexPlugin(Star):
         # 这时「没见过的群号」就是唯一能救场的信号。
         if mode in ("unknown", "both") and group_id not in self._seen_groups:
             return group_id, True
-        # 轮询判定：群列表里刚出现过这个群，短期内到达的第一条消息也算。
-        # 通知和群列表两条路是独立的，任一条能判出来就算。
-        if (self._poll_ready and group_id not in self._known_groups
-                and group_id not in self._seen_groups):
-            return group_id, True
+        # ⚠ 这里**不能**再加「群不在已知列表就算新群」之类的兜底。
+        # 已知列表在插件刚装、还没跑过第一轮轮询时是空的，那种兜底会在
+        # 预热窗口内把群里**任何一条消息**都当成入群——别人说话也发欢迎语。
+        # 群列表这条路已经由 _on_group_appeared 独立处理（它比对的是
+        # 「列表里真的多了一个群」，只有机器人自己被拉进去才会多），
+        # 不需要在这里重复判断，也不该绕过 welcome_detect。
         return "", False
 
     def _claim_group(self, group_id: str) -> bool:
