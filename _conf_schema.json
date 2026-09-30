@@ -18,8 +18,8 @@
         "default": true
     },
     "show_all_cmds": {
-        "description": "显示管理员指令",
-        "hint": "开启后会显示仅管理员可用的指令，需要时再开。每条指令的权限可在 Dashboard 的插件管理里调整。",
+        "description": "显示管理员指令（只管图片）",
+        "hint": "网页是对公网开放的，管理员指令永远不会出现在网页上，这个开关管不到",
         "type": "bool",
         "default": false
     },
@@ -37,22 +37,101 @@
     },
     "custom_cmds": {
         "description": "自定义额外指令",
-        "hint": "正则或监听器形成的指令收集不到，可在这里补充，格式为「命令:描述」",
+        "hint": "正则或监听器形成的指令收集不到，可在这里补充，格式为「命令:描述」。这条列表会同时出现在图片和网页上。",
         "type": "list",
         "default": []
     },
     "plugin_display_names": {
         "description": "插件显示名称",
-        "hint": "部分插件没有外显名称时用这里的中文名，格式为「插件名:显示名称」",
+        "hint": "部分插件没有外显名称时用这里的中文名，格式为「插件名:显示名称」。图鉴里一个插件就是一个分区，这里决定它叫什么",
         "type": "list",
         "default": [
-            "builtin_commands:内置指令"
+            "builtin_commands:内置指令",
+            "help_dex:指令图鉴（本插件）"
         ]
     },
     "plugin_blacklist": {
         "description": "插件黑名单",
-        "hint": "填插件名（区分大小写），黑名单里的插件不出现在图鉴里",
+        "hint": "填插件名（区分大小写），黑名单里的插件不出现在图鉴里。发 /图鉴预览 能看到现在到底哪些被挡住了",
         "type": "list",
         "default": []
+    },
+    "page_enabled": {
+        "description": "启用欢迎页服务",
+        "hint": "关掉就只发图鉴图片，不开网页",
+        "type": "bool",
+        "default": true
+    },
+    "page_port": {
+        "description": "欢迎页本地端口",
+        "hint": "不用改。默认 41783，被占会自动往后找",
+        "type": "int",
+        "default": 41783
+    },
+    "public_base_url": {
+        "description": "对外访问地址",
+        "hint": "这一栏你不用管——发「/图鉴隧道 开」会自动填好。\n手动填的格式长这样（下面是示例，照格式换掉内容）：\nhttps://abc-def.trycloudflare.com\n或永久地址：https://help.你的域名.com\n别填 127.0.0.1 或内网地址，那样只有服务器自己能开。",
+        "type": "string",
+        "default": ""
+    },
+    "page_access_key": {
+        "description": "网页访问密钥",
+        "hint": "URL 路径本身就是这个值，留空会自动生成 32 位随机串。链接一旦泄露，发 /图鉴链接 换 就能立刻让旧地址失效",
+        "type": "string",
+        "default": ""
+    },
+    "welcome_enabled": {
+        "description": "入群引导",
+        "hint": "Bot 自己被拉进群时，发一条带链接的文本。\n发不出来时发 /图鉴诊断 看卡在哪（最常见是那个群不在会话白名单里）",
+        "type": "bool",
+        "default": true
+    },
+    "welcome_text": {
+        "description": "入群引导语",
+        "hint": "{link} 会变成网页地址。默认不表明是机器人",
+        "type": "string",
+        "default": "📎 会的事都写在这一页了，点开随便翻翻 👇\n{link}"
+    },
+    "welcome_quiet_seconds": {
+        "description": "入群静默秒数",
+        "hint": "进群后这段时间内不响应 LLM 调用（指令照常），防一群机器人同时触发。\n和「入群引导」是两个独立开关",
+        "type": "int",
+        "default": 60
+    },
+    "welcome_detect": {
+        "description": "入群判定",
+        "hint": "选「仅允许进群时」＝只有收到进群通知才触发，最严格。\n选「两个都用」＝通知 + 群列表轮询都算，更不容易漏。\n选「仅陌生群」＝只认没见过的群号。选「关掉」＝不触发。\n群列表轮询由单独一项控制，不受这里影响",
+        "type": "string",
+        "default": "notice"
+    },
+    "page_rules": {
+        "description": "网页顶部使用规则",
+        "hint": "显示在网页最顶部，每行一条。也可用指令 /图鉴规则 修改",
+        "type": "list",
+        "default": []
+    },
+    "group_page_overrides": {
+        "description": "按群定制页面",
+        "hint": "一行一条：群号|标题|简介|规则1;规则2;规则3。留空那项不覆盖。发 /图鉴页面 <群号> 看效果",
+        "type": "list",
+        "default": []
+    },
+    "tunnel_autostart": {
+        "description": "启动时自动恢复固定隧道",
+        "hint": "配了固定地址（具名隧道）后，容器重启时自动拉起来，地址不变。关掉就得每次手动发 /图鉴隧道 开",
+        "type": "bool",
+        "default": true
+    },
+    "quiet_enabled": {
+        "description": "进群静默",
+        "hint": "进群后这段时间内不响应 LLM（指令照常），防一群机器人同时触发。\n和「入群时发欢迎」是两个独立开关",
+        "type": "bool",
+        "default": true
+    },
+    "group_poll": {
+        "description": "群列表轮询（入群检测的可靠兜底）",
+        "hint": "每 25 秒拉一次「我当前在哪些群」，新出现的群就是刚被拉进去的。\n不依赖 OneBot 的进群通知——那个在某些实现上根本不上报。关掉就只剩通知和陌生群号两条路",
+        "type": "bool",
+        "default": true
     }
 }
