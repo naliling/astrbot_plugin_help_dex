@@ -10,7 +10,11 @@ from typing import Dict, List, Optional, Tuple
 import aiohttp
 
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.event.filter import EventMessageType, event_message_type
+from astrbot.api.event.filter import (
+    CustomFilter,
+    EventMessageType,
+    event_message_type,
+)
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.core.config.astrbot_config import AstrBotConfig
@@ -106,6 +110,66 @@ HELP_TEXT = """📖 指令图鉴 · 指令一览
 NO_IMAGE_TIP = "⚠️ 没找到图片。用法：/{} + 图片（或直接发图片链接）"
 
 
+class _BotGroupJoinFilter(CustomFilter):
+    """只认「机器人自己被拉进群」这一件事。
+
+    为什么不用 EventMessageType.ALL：框架里每个 handler 跑完都会执行
+    `event.clear_result()`（star_request.py），而 ALL 匹配**所有**群消息——
+    等于 help_dex 在每条消息上都执行一次、每条都清一次结果，
+    排在它后面、依赖 event 结果的插件（比如自主社交）就会被清掉、发不出去。
+
+    换成精确 filter 后，平时 help_dex 的 handler 根本不会被激活，
+    对其它插件零干扰；只有真的「机器人被拉进群」才进来。
+
+    filter 里抛异常后果特别重：WakingCheckStage 会把异常原文
+    「插件 X: {e}」直接发到群里。所以这里全程兜住，绝不往外抛。
+    """
+
+    def filter(self, event, cfg) -> bool:
+        try:
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            if not isinstance(raw, dict):
+                return False
+            if str(raw.get("notice_type") or "") != "group_increase":
+                return False
+            getter = getattr(event, "get_self_id", None)
+            self_id = str(getter() or "").strip() if callable(getter) else ""
+            return bool(self_id) and str(raw.get("user_id") or "") == self_id
+        except Exception:
+            return False
+
+
+class _OnlyAtBotFilter(CustomFilter):
+    """只认「这条消息除了 @ 机器人什么都没有」，同样为了不占 activated_handlers。"""
+
+    def filter(self, event, cfg) -> bool:
+        try:
+            if (getattr(event, "message_str", "") or "").strip():
+                return False
+            self_id = str(getattr(getattr(event, "message_obj", None), "self_id", "") or "")
+            if not self_id:
+                get = getattr(event, "get_self_id", None)
+                self_id = str(get() or "") if callable(get) else ""
+            if not self_id:
+                return False
+            try:
+                components = list(event.get_messages())
+            except Exception:
+                return False
+            at_bot = False
+            for comp in components:
+                if isinstance(comp, At):
+                    if str(getattr(comp, "qq", "") or "") == self_id:
+                        at_bot = True
+                    continue
+                if isinstance(comp, Plain) and not (getattr(comp, "text", "") or "").strip():
+                    continue
+                return False
+            return at_bot
+        except Exception:
+            return False
+
+
 def _arg_after(text: str, command: str) -> str:
     raw = (text or "").strip()
     index = raw.find(command)
@@ -125,7 +189,7 @@ def _image_components(event: AstrMessageEvent) -> List[Image]:
     PLUGIN_NAME,
     "娜莉灵",
     "一条指令，把机器人会的一切画成一张暗色科幻风图鉴。群里@一下就发图；背景、Logo、配色想换就换，发张图发条指令秒生效，不用碰文件不用重启",
-    "0.5.1",
+    "0.5.2",
 )
 class HelpDexPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -704,7 +768,7 @@ class HelpDexPlugin(Star):
             return 0.0
         return left
 
-    @event_message_type(EventMessageType.ALL)
+    @filter.custom_filter(_BotGroupJoinFilter)
     async def watch_group_join(self, event: AstrMessageEvent):
         """Bot 被拉进群：开静默窗口，并发一条带链接的文本。
 
@@ -811,29 +875,12 @@ class HelpDexPlugin(Star):
                     f"网页版也在这儿（每条指令都能一键复制）：\n{link}"
                 )
 
-    @event_message_type(EventMessageType.ALL)
+    @filter.custom_filter(_OnlyAtBotFilter)
     async def at_only_help(self, event: AstrMessageEvent):
-        """群里只 @ 机器人（不带任何文字）时，直接发送指令图鉴"""
-        if (getattr(event, "message_str", "") or "").strip():
-            return
-        message_obj = getattr(event, "message_obj", None)
-        self_id = str(getattr(message_obj, "self_id", "") or "")
-        try:
-            components = event.get_messages()
-        except Exception:
-            return
-        at_me = False
-        for comp in components:
-            if isinstance(comp, At):
-                qq = str(getattr(comp, "qq", "") or "")
-                if qq and (not self_id or qq == self_id):
-                    at_me = True
-                continue
-            if isinstance(comp, Plain) and not (getattr(comp, "text", "") or "").strip():
-                continue
-            return
-        if not at_me:
-            return
+        """群里只 @ 机器人（不带任何文字）时，直接发送指令图鉴。
+
+        「是不是只 @ 了机器人」由 _OnlyAtBotFilter 在激活阶段就判完了。
+        """
         if not self.collect_commands():
             return
         image = self._render_image()

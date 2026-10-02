@@ -1,6 +1,35 @@
 # 更新日志
 
-## v0.5.1
+## v0.5.2
+
+### 修：和别的插件冲突（严重）
+
+框架 `star_request.py` 里有这么一段：
+
+    async for ret in wrapper:
+        yield ret
+    if event.is_stopped():
+        break
+    event.clear_result()      # 清除上一个 handler 的结果
+
+**每个 handler 跑完都会清一次事件结果。** 而本插件原来用
+`@event_message_type(EventMessageType.ALL)` 装饰了两个 handler——
+`ALL` 匹配**所有**群消息，等于 help_dex 在群里每一条消息上都激活一次、
+执行一次、清一次结果。排在它后面、依赖事件结果的插件（比如自主社交）
+就会被清掉，消息发不出去。
+
+现在两个 handler 都换成精确的 `CustomFilter`：
+
+- 入群那个：只在 `notice_type == "group_increase"` 且 `user_id` 等于机器人自己
+  时才通过。平时根本不会被激活，对其它插件零干扰。
+- 只 @ 机器人发图鉴那个：只在「消息里除了 @ 机器人什么都没有」时通过。
+
+`WakingCheckStage` 里 filter 不通过的 handler 压根不会进 `activated_handlers`，
+所以平时 help_dex 不再碰事件结果。
+
+另外确认了「只有拉机器人进群才触发」：别人进群不进、普通消息不进、
+预热窗口内也不进。filter 全程兜异常，不会像框架那样把异常原文发到群里。
+
 
 ### 修：别人进群 / 群里随便说话也会触发欢迎语
 
