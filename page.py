@@ -621,7 +621,7 @@ INSTALL_HINT = (
     "装完再发一次同样的指令。"
 )
 
-CLOUDFLARE_DIR = Path.home() / ".cloudflare"
+CLOUDFLARE_DIR = Path.home() / ".cloudflared"
 CONFIG_YML = CLOUDFLARE_DIR / "config.yml"
 CERT_PEM = CLOUDFLARE_DIR / "cert.pem"
 TUNNEL_NAME = "helpdex"
@@ -648,16 +648,18 @@ class TunnelManager:
     BOOT_TIMEOUT = 30.0
     WATCH_INTERVAL = 20.0
 
-    def __init__(self) -> None:
+    def __init__(self, on_url_changed: Optional[Callable[[str], None]] = None) -> None:
         self.mode = ""
         self.port = 0
         self.proc = None
         self.url = None
+        self.on_url_changed = on_url_changed
         self._ready = None
         self._reader = None
         self._login_proc = None
         self._watcher = None
         self._watching = None
+        self._booted_at = 0.0
 
     # ---------- 环境 ----------
 
@@ -754,6 +756,14 @@ class TunnelManager:
         )
         self._ready = asyncio.Event()
         self._reader = asyncio.create_task(self._drain())
+        # 进程刚建，给它一个 startup 期限；超时仍未拿到地址就判失败。
+        # 不能只靠 running() 判断——进程活着但连不上 Cloudflare 时，
+        # 地址永远拿不到，链接就会一直是死的。
+        self._booted_at = asyncio.get_running_loop().time()
+
+    def ready_for(self, seconds: float = 0.0) -> bool:
+        """地址是否已经拿到。guard 用：进程在跑 ≠ 链接可用。"""
+        return bool(self.url) and self.running()
 
     async def _drain(self) -> None:
         """cloudflared 把地址打在 stderr。必须一直读干净，
@@ -811,13 +821,14 @@ class TunnelManager:
 
     # ---------- 临时隧道 ----------
 
-    async def start_quick(self, port: int) -> str:
+    async def start_quick(self, port: int, keep_watchdog: bool = False) -> str:
         self.mode = "quick"
         self.port = port
         await self._spawn(["tunnel", "--no-autoupdate", "--url",
                            "http://127.0.0.1:{}".format(port)])
         await self._wait_ready(self.BOOT_TIMEOUT)
-        self._start_watchdog()
+        if not keep_watchdog:
+            self._start_watchdog()
         return self.url or ""
 
     # ---------- 具名隧道（固定地址） ----------
@@ -906,7 +917,7 @@ class TunnelManager:
         )
         return hostname
 
-    async def start_named(self, port: int) -> str:
+    async def start_named(self, port: int, keep_watchdog: bool = False) -> str:
         hostname = self.named_hostname()
         if not hostname:
             raise TunnelError(
@@ -916,39 +927,81 @@ class TunnelManager:
         self.port = port
         await self._spawn(["tunnel", "--no-autoupdate", "run"])
         self.url = "https://" + hostname
-        self._start_watchdog()
+        if not keep_watchdog:
+            self._start_watchdog()
         return self.url
 
     # ---------- 统一入口与保活 ----------
 
-    async def start(self, port: int) -> str:
-        """具名隧道优先。配了就用固定的，没配才用临时的。"""
+    async def start(self, port: int, keep_watchdog: bool = False) -> str:
+        """具名隧道优先。配了就用固定的，没配才用临时的。
+
+        keep_watchdog=True 供守护进程自己调用：此时绝不能走 stop()，
+        因为 stop() 会 cancel(self._watcher)——守护任务会把自己杀掉，
+        表现就是「自动重连只生效一次，之后永不恢复」。
+        """
         if not self.is_available():
             raise TunnelError(INSTALL_HINT)
         if self.running() and self.url:
             return self.url
-        await self.stop()
+        if keep_watchdog:
+            self._kill_proc_only()
+        else:
+            await self.stop()
         if self.named_hostname():
-            return await self.start_named(port)
-        return await self.start_quick(port)
+            return await self.start_named(port, keep_watchdog=keep_watchdog)
+        return await self.start_quick(port, keep_watchdog=keep_watchdog)
+
+    def _kill_proc_only(self) -> None:
+        """只清进程与状态，**不动守护任务**。守护重启专用。"""
+        if self._reader is not None:
+            self._reader.cancel()
+            self._reader = None
+        proc = self.proc
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        self.proc = None
+        self.url = None
+        self.mode = ""
+        self._ready = None
 
     def _start_watchdog(self) -> None:
-        """进程被机器休眠、网络抖动带走时自动拉起。"""
+        """进程死了（休眠、网络抖动、连不上被踢）自动拉起并写入新地址。"""
         if self._watcher is not None and not self._watcher.done():
             return
 
         async def watch() -> None:
             while True:
                 await asyncio.sleep(self.WATCH_INTERVAL)
-                if self.running() or not self.port:
+                if not self.port:
                     continue
-                # 死了就重开同一种模式，地址变了照样能用
+                healthy = self.ready_for() and self._url_still_alive()
+                if healthy:
+                    continue
+                # 进程在跑但地址一直拿不到（例如刚启动连不上），也重开
+                if self.running() and self.url and self._boot_elapsed() < self.BOOT_TIMEOUT:
+                    continue
                 try:
-                    await self.start(self.port)
+                    url = await self.start(self.port, keep_watchdog=True)
+                    if self.on_url_changed is not None and url:
+                        self.on_url_changed(url)
                 except Exception:
                     pass
 
         self._watcher = asyncio.create_task(watch())
+
+    def _boot_elapsed(self) -> float:
+        try:
+            return asyncio.get_running_loop().time() - getattr(self, "_booted_at", 0.0)
+        except RuntimeError:
+            return 0.0
+
+    def _url_still_alive(self) -> bool:
+        """拿到地址不算数，进程还得活着——否则地址是死的。"""
+        return self.running()
 
     async def stop(self) -> None:
         if self._watcher is not None:

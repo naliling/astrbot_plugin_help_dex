@@ -111,18 +111,14 @@ NO_IMAGE_TIP = "⚠️ 没找到图片。用法：/{} + 图片（或直接发图
 
 
 class _BotGroupJoinFilter(CustomFilter):
-    """只认「机器人自己被拉进群」这一件事。
+    """只认「机器人自己进群/被移出群」两件事。
 
     为什么不用 EventMessageType.ALL：框架里每个 handler 跑完都会执行
-    `event.clear_result()`（star_request.py），而 ALL 匹配**所有**群消息——
-    等于 help_dex 在每条消息上都执行一次、每条都清一次结果，
-    排在它后面、依赖 event 结果的插件（比如自主社交）就会被清掉、发不出去。
+    `event.clear_result()`，而 ALL 匹配**所有**群消息——help_dex 在每条消息上
+    都执行一次、清一次结果，会把排在后面的插件（比如自主社交）的结果清掉。
 
-    换成精确 filter 后，平时 help_dex 的 handler 根本不会被激活，
-    对其它插件零干扰；只有真的「机器人被拉进群」才进来。
-
-    filter 里抛异常后果特别重：WakingCheckStage 会把异常原文
-    「插件 X: {e}」直接发到群里。所以这里全程兜住，绝不往外抛。
+    精确匹配后，平时 help_dex 的 handler 根本不会被激活；只有机器人自己
+    被拉进群或被踢出群时才进来。
     """
 
     def filter(self, event, cfg) -> bool:
@@ -130,11 +126,12 @@ class _BotGroupJoinFilter(CustomFilter):
             raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
             if not isinstance(raw, dict):
                 return False
-            if str(raw.get("notice_type") or "") != "group_increase":
-                return False
+            notice = str(raw.get("notice_type") or "")
             getter = getattr(event, "get_self_id", None)
             self_id = str(getter() or "").strip() if callable(getter) else ""
-            return bool(self_id) and str(raw.get("user_id") or "") == self_id
+            if not self_id or str(raw.get("user_id") or "") != self_id:
+                return False
+            return notice in ("group_increase", "group_decrease")
         except Exception:
             return False
 
@@ -189,7 +186,7 @@ def _image_components(event: AstrMessageEvent) -> List[Image]:
     PLUGIN_NAME,
     "娜莉灵",
     "一条指令，把机器人会的一切画成一张暗色科幻风图鉴。群里@一下就发图；背景、Logo、配色想换就换，发张图发条指令秒生效，不用碰文件不用重启",
-    "0.5.2",
+    "0.5.4",
 )
 class HelpDexPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -198,14 +195,16 @@ class HelpDexPlugin(Star):
         self.data_dir = Path(get_astrbot_data_path()).joinpath("plugin_data", PLUGIN_NAME)
         self.style = StyleStore(self.data_dir)
         self.server: Optional[PageServer] = None
-        self._tunnel = TunnelManager()
+        self._tunnel = TunnelManager(on_url_changed=self._on_tunnel_url_changed)
         self._quiet: Dict[str, float] = {}
         self._seen_groups = self._load_seen_groups()
         self._fired_groups: set = set()
         self._probe_ok: Optional[bool] = None
         self._probed_at: float = 0.0
         self._recent: List[dict] = []
-        self._known_groups: set = self._load_known_groups()
+        loaded_groups = self._load_known_groups()
+        self._known_groups_initialized = loaded_groups is not None
+        self._known_groups: set = loaded_groups or set()
         self._poller = None
         self._poll_ready = False
         self._last_poll_error = ""
@@ -308,16 +307,18 @@ class HelpDexPlugin(Star):
         except Exception as exc:
             logger.warning(f"[help_dex] 保存配置失败: {exc}")
 
-    def _load_known_groups(self) -> set:
+    def _load_known_groups(self) -> Optional[set]:
         try:
             raw = json.loads(
                 (self.data_dir / KNOWN_GROUPS_FILE).read_text(encoding="utf-8")
             )
+        except FileNotFoundError:
+            return None
         except Exception:
-            return set()
+            return None
         known = raw.get("known") if isinstance(raw, dict) else None
         if not isinstance(known, list):
-            return set()
+            return None
         return {str(item).strip() for item in known if str(item).strip()}
 
     def _save_known_groups(self) -> None:
@@ -451,42 +452,64 @@ class HelpDexPlugin(Star):
         )
         await self._send_to_group(group_id, template.replace("{link}", link))
 
+    async def _apply_group_snapshot(self, current: set) -> None:
+        """应用一次成功获取的完整群列表。
+
+        首次成功读取才建立基线；首次请求失败不能消耗首轮状态，
+        否则第二次成功会把所有已有群误判成新群并群发欢迎。
+        """
+        if not self._known_groups_initialized:
+            logger.info(f"[help_dex] 群列表基线：当前在 {len(current)} 个群")
+            self._known_groups = set(current)
+            self._known_groups_initialized = True
+            self._save_known_groups()
+            self._poll_ready = True
+            return
+
+        departed = self._known_groups - current
+        arrived = current - self._known_groups
+        if departed:
+            for gid in departed:
+                self._forget_group(gid)
+            self._save_seen_groups()
+        for gid in sorted(arrived):
+            await self._on_group_appeared(gid)
+        self._known_groups = set(current)
+        self._save_known_groups()
+        self._poll_ready = True
+
     async def _group_poll_loop(self) -> None:
         await asyncio.sleep(GROUP_POLL_WARMUP)
-        first = True
         while True:
             try:
                 current = await self._fetch_group_ids()
                 if current is not None:
-                    if first:
-                        # 第一轮只建基线。否则所有老群都会被当成新群，
-                        # 一启动就给每个群发一遍欢迎。
-                        if not self._known_groups:
-                            logger.info(
-                                f"[help_dex] 群列表基线：当前在 {len(current)} 个群"
-                            )
-                        else:
-                            arrived = current - self._known_groups
-                            if arrived:
-                                logger.info(
-                                    f"[help_dex] 停机期间新进的群：{sorted(arrived)}"
-                                )
-                                for gid in sorted(arrived):
-                                    await self._on_group_appeared(gid)
-                        self._known_groups = current
-                        self._save_known_groups()
-                    else:
-                        for gid in sorted(current - self._known_groups):
-                            await self._on_group_appeared(gid)
-                        self._known_groups = current
-                        self._save_known_groups()
-                    self._poll_ready = True
+                    await self._apply_group_snapshot(current)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning(f"[help_dex] 群列表轮询异常: {exc}")
-            first = False
             await asyncio.sleep(GROUP_POLL_INTERVAL)
+
+    def _forget_group(self, group_id: str) -> None:
+        self._seen_groups.discard(group_id)
+        self._fired_groups.discard(group_id)
+        self._quiet.pop(group_id, None)
+
+    def _forget_bot_left(self, event: AstrMessageEvent) -> None:
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        if str(raw.get("notice_type") or "") != "group_decrease":
+            return
+        self_id = str(event.get_self_id() or "").strip()
+        if not self_id or str(raw.get("user_id") or "") != self_id:
+            return
+        group_id = str(raw.get("group_id") or event.get_group_id() or "").strip()
+        if group_id:
+            self._forget_group(group_id)
+            self._save_seen_groups()
+            logger.info(f"[help_dex] 机器人离开群 {group_id}，已清理入群去重状态")
 
     def _start_group_poll(self) -> None:
         if not bool(getattr(self.config, "group_poll", True)):
@@ -621,6 +644,22 @@ class HelpDexPlugin(Star):
         logger.info(f"[help_dex] 对外地址探测结果: {'通' if ok else '不通'}（{probe_url}）")
         return ok
 
+    def _on_tunnel_url_changed(self, url: str) -> None:
+        """守护进程重开隧道后地址会变，必须立刻回写配置。
+
+        不回写的话：入群发的还是旧地址，而旧地址已经作废。
+        临时隧道本来就每次重开都换地址，这里就是它“链接能不能用”的关键一环。
+        """
+        if not url:
+            return
+        if str(getattr(self.config, "public_base_url", "") or "").strip() == url:
+            return
+        self.config["public_base_url"] = url
+        self._save_config()
+        self._probe_ok = None
+        self._probed_at = 0.0
+        logger.info(f"[help_dex] 隧道地址已更新并写回配置：{url}")
+
     async def _resolve_link(self, group_id: str = "", force: bool = False) -> Optional[str]:
         link = self._public_link(group_id)
         if not link:
@@ -635,6 +674,12 @@ class HelpDexPlugin(Star):
                 "配置里存的是临时地址，但隧道进程没在跑——"
                 "临时地址每次重启都会变，这是正常的。发 /图鉴隧道 开 会换一个。"
             )
+            return None
+        # 进程在跑但地址还没拿到（刚重开、还在握手）：此时发链接必然是死链
+        if base.endswith(".trycloudflare.com") and not self._tunnel.url:
+            self._probe_ok = False
+            self._probed_at = time.time()
+            self._link_down_reason = "隧道刚重开、地址还没就绪，稍等几秒再试。"
             return None
         fresh = (
             self._probe_ok is not None and (time.time() - self._probed_at) < PROBE_TTL
@@ -770,15 +815,13 @@ class HelpDexPlugin(Star):
 
     @filter.custom_filter(_BotGroupJoinFilter)
     async def watch_group_join(self, event: AstrMessageEvent):
-        """Bot 被拉进群：开静默窗口，并发一条带链接的文本。
-
-        静默要先于欢迎语的去重判断：欢迎语只发一次是为了不刷屏，
-        但静默是防撞车，重复开一个窗口没有任何副作用。
-        之前写成 `if not joined or not self._claim_group(...): return`，
-        于是「已经发过欢迎语的群」连静默都开不了——而管理员测试几次之后
-        必然落在那个名单里，表现就是静默从来没生效过。
-        """
+        """机器人进群：开静默并发引导；机器人离群：清去重，允许同进程重拉再触发。"""
         try:
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            notice = str(raw.get("notice_type") or "") if isinstance(raw, dict) else ""
+            if notice == "group_decrease":
+                self._forget_bot_left(event)
+                return
             group_id, joined = self._detect_group_join(event)
         except Exception as exc:
             # 这里的异常会被框架当异常消息发到群里，必须自己吃掉
@@ -1449,7 +1492,6 @@ class HelpDexPlugin(Star):
             quiet = int(getattr(self.config, "welcome_quiet_seconds", 60) or 0)
         except (TypeError, ValueError):
             quiet = 60
-        lines.append("进群静默：{} 秒".format(quiet))
         lines.append("判定方式：{}".format(_DETECT_LABELS.get(
             str(getattr(self.config, "welcome_detect", "notice") or "notice").lower(),
             getattr(self.config, "welcome_detect", "notice"))))
