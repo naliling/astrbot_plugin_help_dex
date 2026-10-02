@@ -56,14 +56,19 @@ KNOWN_GROUPS_FILE = "known_groups.json"
 
 # 群列表轮询：group_increase 通知在某些 OneBot 实现上根本不上报，
 # 群列表是另一条独立可靠的路——机器人在的群才会出现在里面。
-GROUP_POLL_INTERVAL = 25.0
-GROUP_POLL_WARMUP = 8.0
+# 间隔不能太大：它是「进群后多久才发链接」的唯一决定因素（通知没来时）。
+GROUP_POLL_INTERVAL = 8.0
+GROUP_POLL_WARMUP = 2.0
 GROUP_POLL_TIMEOUT = 15.0
 
-_DETECT_LABELS = {"notice": "仅允许进群时", "both": "两个都用",
+_DETECT_LABELS = {"notice": "仅进群通知", "both": "通知 + 群列表",
                    "unknown": "仅陌生群", "off": "关掉"}
 
-DEFAULT_WELCOME_TEXT = "📎 会的事都写在这一页了，点开随便翻翻 👇\n{link}"
+# 默认引导语：不表明是机器人，不放表情包堆砌，把链接单独一行。
+DEFAULT_WELCOME_TEXT = "我到了，这页写着我都能做什么：\n{link}"
+
+# 链接暂时不可用时的占位引导。不能让人以为它就是最终那条链接。
+LINK_PENDING_TEXT = "我到了，正在准备说明书，稍后发上来。"
 
 # 探测对外地址：太短会误判成不通，太长会把入群卡住
 PROBE_TIMEOUT = 3.5
@@ -78,34 +83,22 @@ _IMAGE_SIGNATURES = (
     (b"RIFF", ".webp"),
 )
 
-HELP_TEXT = """📖 指令图鉴 · 指令一览
+HELP_TEXT = """📖 指令图鉴
 
-所有人可用：
-/帮助图鉴 —— 生成一张指令图鉴图片（发 指令图鉴 也行）
-群里只 @ 我 —— 不带任何文字，也会直接发图鉴
-/图鉴预览 —— 看当前图鉴效果与自定义状态
+用：/帮助图鉴 发一张图；群里只 @ 我 也发。
 
-管理员可用（改完立即生效，不用重启）：
-/图鉴背景 + 图片 —— 上传背景图（也可发图片链接；发「重置」恢复默认渐变）
-/图鉴logo + 图片 —— 上传 Logo（白底会自动抠掉；发「重置」移除）
-/图鉴颜色 <部位> <颜色> —— 改字体/配色，如 /图鉴颜色 标题 #FF5733
-  部位：背景 标题 副标题 区块 指令 描述 强调 卡片 边框 页脚
-  「背景」可给两个颜色做渐变：/图鉴颜色 背景 #FFF7E6 #FFE3EE
-  单独发 /图鉴颜色 可查看当前配色；「/图鉴颜色 重置」全部恢复默认
-/图鉴标题 <文字> —— 改图鉴大标题（发「重置」恢复配置里的值）
-/图鉴简介 <文字> —— 改标题下面那行简介
-/图鉴重置 —— 颜色、标题、背景、Logo 全部恢复默认
-/图鉴入群 开|关 —— 开关「入群引导」与「入群静默」
-/图鉴静默 <秒> —— 进群后多久不响应 LLM（默认 60，只挡 LLM，指令照常）
-/图鉴规则 <文字> —— 改网页顶部的使用规则（换行分条，发「重置」清空）
-/图鉴链接 —— 把当前网页地址发出来；「/图鉴链接 换」轮换访问密钥（旧地址即刻失效）
-/图鉴隧道 开|关 —— 开/关公网隧道
-/图鉴隧道 固定 <域名> —— 换成永久不变的地址（需域名托管在 Cloudflare）
-/图鉴隧道 登录 —— 第一次用固定地址时，在浏览器点一下授权
-/图鉴页面 [群号] —— 看某个群的网页专属配置（群里发就默认看当前群）
-/图鉴诊断 —— 入群欢迎不触发时发这个，看卡在哪一步
+管理：
+/图鉴背景 · /图鉴logo · /图鉴颜色 · /图鉴标题 · /图鉴简介 —— 换外观
+/图鉴重置 —— 外观全恢复默认
+/图鉴入群 开|关 —— 开关进群引导
+/图鉴静默 <秒> —— 进群后多久不回话，0 关（只压制自动回复，指令随时可用）
+/图鉴规则 <文字> —— 改网页顶部规则
+/图鉴链接 —— 看网页地址；加「换」换密钥
+/图鉴隧道 开|关|固定|登录 —— 开公网、固定地址
+/图鉴页面 [群号] —— 看某群网页配置
+/图鉴诊断 —— 排查进群不发链接
 
-自定义数据存在 data/plugin_data/help_dex/，插件升级不会丢。"""
+数据在 data/plugin_data/help_dex/，升级不丢。"""
 
 NO_IMAGE_TIP = "⚠️ 没找到图片。用法：/{} + 图片（或直接发图片链接）"
 
@@ -186,7 +179,7 @@ def _image_components(event: AstrMessageEvent) -> List[Image]:
     PLUGIN_NAME,
     "娜莉灵",
     "一条指令，把机器人会的一切画成一张暗色科幻风图鉴。群里@一下就发图；背景、Logo、配色想换就换，发张图发条指令秒生效，不用碰文件不用重启",
-    "0.5.4",
+    "0.5.5",
 )
 class HelpDexPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -197,6 +190,7 @@ class HelpDexPlugin(Star):
         self.server: Optional[PageServer] = None
         self._tunnel = TunnelManager(on_url_changed=self._on_tunnel_url_changed)
         self._quiet: Dict[str, float] = {}
+        self._pending_link: set = set()
         self._seen_groups = self._load_seen_groups()
         self._fired_groups: set = set()
         self._probe_ok: Optional[bool] = None
@@ -209,6 +203,7 @@ class HelpDexPlugin(Star):
         self._poll_ready = False
         self._last_poll_error = ""
         self._link_down_reason = ""
+        self._suppress_welcome_until = 0.0
 
     # -------------------- 生命周期 --------------------
     async def initialize(self) -> None:
@@ -429,28 +424,55 @@ class HelpDexPlugin(Star):
                 logger.warning(f"[help_dex] 主动发消息失败({umo}): {exc}")
         return False
 
-    async def _on_group_appeared(self, group_id: str) -> None:
-        """群列表里冒出一个新群 = 机器人被拉进去了。"""
-        logger.info(f"[help_dex] 群 {group_id} 新出现在机器人群列表里，按入群处理")
-        if bool(getattr(self.config, "quiet_enabled", True)):
-            self._open_quiet(group_id)
-        if not bool(getattr(self.config, "welcome_enabled", True)):
-            return
-        if not self._claim_group(group_id):
-            return
+    async def _deliver_welcome(self, group_id: str) -> bool:
+        """发一条引导。地址不可用时登记待补，不占用「已发」名额。
+
+        关键：地址不可用不能 count 成“发过了”——如果那样，隧道之后恢复，
+        这个群就永远收不到链接（旧实现就是这个毛病：发一句“稍后发”，
+        然后再也不发）。所以只有真正发出链接才 claim 这个群。
+        """
         link = await self._resolve_link(group_id)
         if not link:
-            await self._send_to_group(
-                group_id,
-                "我刚到这个群，图鉴链接还在配置，"
-                "先在这儿打个招呼，指令稍后自己发你。",
-            )
-            return
+            if group_id not in self._pending_link:
+                self._pending_link.add(group_id)
+                await self._send_to_group(group_id, LINK_PENDING_TEXT)
+                logger.info(
+                    f"[help_dex] 群 {group_id} 链接暂不可用，已登记待补发"
+                )
+            return False
         template = (
             str(getattr(self.config, "welcome_text", "") or "").strip()
             or DEFAULT_WELCOME_TEXT
         )
         await self._send_to_group(group_id, template.replace("{link}", link))
+        self._pending_link.discard(group_id)
+        return True
+
+    async def _flush_pending_links(self) -> None:
+        """隧道就绪后，把之前没发成链接的群补上。"""
+        if not self._pending_link:
+            return
+        template = (
+            str(getattr(self.config, "welcome_text", "") or "").strip()
+            or DEFAULT_WELCOME_TEXT
+        )
+        for group_id in sorted(self._pending_link):
+            link = await self._resolve_link(group_id)
+            if not link:
+                continue
+            await self._send_to_group(group_id, template.replace("{link}", link))
+            self._pending_link.discard(group_id)
+            logger.info(f"[help_dex] 已给群 {group_id} 补发链接")
+
+    async def _on_group_appeared(self, group_id: str) -> None:
+        """群列表里冒出一个新群 = 机器人被拉进去了。"""
+        logger.info(f"[help_dex] 群 {group_id} 新出现在机器人群列表里，按入群处理")
+        self._open_quiet(group_id)
+        if not bool(getattr(self.config, "welcome_enabled", True)):
+            return
+        if not self._claim_group(group_id):
+            return
+        await self._deliver_welcome(group_id)
 
     async def _apply_group_snapshot(self, current: set) -> None:
         """应用一次成功获取的完整群列表。
@@ -485,6 +507,7 @@ class HelpDexPlugin(Star):
                 current = await self._fetch_group_ids()
                 if current is not None:
                     await self._apply_group_snapshot(current)
+                await self._flush_pending_links()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -649,16 +672,19 @@ class HelpDexPlugin(Star):
 
         不回写的话：入群发的还是旧地址，而旧地址已经作废。
         临时隧道本来就每次重开都换地址，这里就是它“链接能不能用”的关键一环。
+        顺带把之前没发成链接的群补上（隧道就绪 = 现在能发了）。
         """
         if not url:
             return
-        if str(getattr(self.config, "public_base_url", "") or "").strip() == url:
-            return
-        self.config["public_base_url"] = url
-        self._save_config()
-        self._probe_ok = None
-        self._probed_at = 0.0
-        logger.info(f"[help_dex] 隧道地址已更新并写回配置：{url}")
+        changed = str(getattr(self.config, "public_base_url", "") or "").strip() != url
+        if changed:
+            self.config["public_base_url"] = url
+            self._save_config()
+            self._probe_ok = None
+            self._probed_at = 0.0
+            logger.info(f"[help_dex] 隧道地址已更新并写回配置：{url}")
+        if self._pending_link:
+            asyncio.create_task(self._flush_pending_links())
 
     async def _resolve_link(self, group_id: str = "", force: bool = False) -> Optional[str]:
         link = self._public_link(group_id)
@@ -764,8 +790,7 @@ class HelpDexPlugin(Star):
                 "用法：/图鉴入群 试 <群号>（在群里发就默认用当前群）"
             )
             return
-        if bool(getattr(self.config, "quiet_enabled", True)):
-            self._open_quiet(group_id)
+        self._open_quiet(group_id)
         try:
             quiet = int(getattr(self.config, "welcome_quiet_seconds", 60) or 0)
         except (TypeError, ValueError):
@@ -796,6 +821,8 @@ class HelpDexPlugin(Star):
             yield event.plain_result("👋（图鉴也渲染失败了，看后台日志）")
 
     def _open_quiet(self, group_id: str) -> None:
+        if not bool(getattr(self.config, "quiet_enabled", True)):
+            return
         try:
             seconds = int(getattr(self.config, "welcome_quiet_seconds", 60) or 0)
         except (TypeError, ValueError):
@@ -831,32 +858,23 @@ class HelpDexPlugin(Star):
             return
         # 静默和「发不发欢迎语」是两件事，不该绑在一起：
         # 关掉欢迎语但仍要防撞车的情况是存在的。
-        if bool(getattr(self.config, "quiet_enabled", True)):
-            self._open_quiet(group_id)
+        self._open_quiet(group_id)
         if not self._claim_group(group_id):
             logger.info(
                 f"[help_dex] 群 {group_id} 这次又收到入群事件，"
-                "静默窗口已重开，欢迎语不重复发。"
+                "静默窗口已重开，引导不重复发。"
             )
             return
-        link = await self._resolve_link(group_id)
-        if link:
-            template = (
-                str(getattr(self.config, "welcome_text", "") or "").strip()
-                or DEFAULT_WELCOME_TEXT
-            )
-            logger.info(f"[help_dex] 群 {group_id} 触发入群欢迎，发网页链接")
-            await self._announce(event, template.replace("{link}", link))
+        logger.info(f"[help_dex] 群 {group_id} 触发入群引导")
+        if await self._deliver_welcome(group_id):
             return
-        # 对外地址没配或探不通就不发链接，宁可退回图鉴，也绝不发一条点不开的死链
-        logger.warning(
-            "[help_dex] 对外地址不可用，本次入群不发链接，改发图鉴图片"
-        )
+        # 链接还没就绪：已登记待补发（轮询和隧道就绪时都会自动补），
+        # 同时先把图鉴图片发出去，不让人干等。
         image = self._render_image()
         if image:
             await self._announce(event, None, image)
         else:
-            await self._announce(event, "👋")
+            await self._announce(event, LINK_PENDING_TEXT)
 
     @staticmethod
     async def _announce(event: AstrMessageEvent, text: Optional[str] = None,
@@ -887,15 +905,22 @@ class HelpDexPlugin(Star):
 
     @filter.on_waiting_llm_request()
     async def guard_llm(self, event: AstrMessageEvent):
-        """静默窗口内掐掉 LLM 请求，指令照常。
+        """静默窗口内只拦「自动回话」，带指令输出的不拦。
 
-        只能靠 stop_event：钩子里 raise 会被 call_event_hook 的
-        except BaseException 吞掉只打日志，请求照发。
-        用 on_waiting_llm_request 而不是 on_llm_request，因为前者更靠前，
-        在抢会话锁之前就挡住了。
+        这里是唯一真正能拦住 LLM 的地方：钩子里 raise 会被 call_event_hook
+        的 except BaseException 吞掉只打日志，请求照发；只有 stop_event 能让
+        它返回 True 从而中断。
+
+        但 stop_event 会连本轮的回复一起停掉，所以分两种：
+        - 事件上已经带着指令输出（get_result() 不为 None）→ 不拦，让指令发出去
+        - 纯粹聊天、没有任何指令输出 → 拦，这就是「静默」压制的对象
         """
         group_id = self._group_of(event)
-        if group_id and self._quiet_left(group_id) > 0.0:
+        if not group_id or self._quiet_left(group_id) <= 0.0:
+            return
+        getter = getattr(event, "get_result", None)
+        result = getter() if callable(getter) else None
+        if result is None:
             event.stop_event()
 
     # -------------------- 对外指令 --------------------
@@ -1127,27 +1152,33 @@ class HelpDexPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("图鉴静默")
     async def set_quiet(self, event: AstrMessageEvent):
-        """设置进群后多久不响应 LLM（管理员）"""
+        """设置进群后多久不自动回话（管理员）"""
         arg = _arg_after(event.message_str, "图鉴静默")
         if not arg:
+            current = getattr(self.config, "welcome_quiet_seconds", 60)
             yield event.plain_result(
-                f"当前：{getattr(self.config, 'welcome_quiet_seconds', 60)} 秒\n"
-                "用法：/图鉴静默 60（填 0 表示不静默）\n"
-                "静默只挡 LLM 调用，指令照常响应。"
+                "进群静默：{}\n".format(f"{current} 秒" if current else "关")
+                + "作用：进群后这段时间，别人 @ 我我不会自动回，\n"
+                "避免一群机器人刚进群就抢着说话。\n"
+                "**指令不受影响**：/帮助图鉴 这类指令随时照常用。\n"
+                "改：/图鉴静默 <秒>（0 关掉）"
             )
             return
         try:
             seconds = int(arg)
         except ValueError:
-            yield event.plain_result("❌ 请填一个整数秒数，比如 /图鉴静默 60。")
+            yield event.plain_result("请填整数秒，如 /图鉴静默 60；0 = 关掉。")
             return
         seconds = max(0, min(3600, seconds))
         self.config["welcome_quiet_seconds"] = seconds
         self._save_config()
         if seconds == 0:
-            yield event.plain_result("✅ 已关闭进群静默。")
+            yield event.plain_result("✅ 已关掉进群静默，进群后别人 @ 我会正常回话。")
         else:
-            yield event.plain_result(f"✅ 进群静默已设为 {seconds} 秒。")
+            yield event.plain_result(
+                f"✅ 进群静默 {seconds} 秒。\n"
+                f"这段时间只压制自动回话，指令照常能用。"
+            )
 
     def _page_status_lines(self) -> List[str]:
         """网页功能到底是开着还是死着，一眼看得出来。"""
@@ -1481,72 +1512,69 @@ class HelpDexPlugin(Star):
 
     @filter.command("图鉴诊断")
     async def diagnose(self, event: AstrMessageEvent):
-        """排查入群欢迎为什么不触发（所有人可用）"""
-        lines = ["🔧 入群欢迎诊断："]
-        lines.append(
-            "入群欢迎：{}".format(
-                "开" if bool(getattr(self.config, "welcome_enabled", True)) else "❌ 关着"
-            )
-        )
+        """排查进群为什么不发链接（所有人可用）"""
+        enabled = bool(getattr(self.config, "welcome_enabled", True))
         try:
             quiet = int(getattr(self.config, "welcome_quiet_seconds", 60) or 0)
         except (TypeError, ValueError):
             quiet = 60
+        lines = ["🔧 图鉴诊断"]
+        lines.append("")
+        lines.append("【开关】")
+        lines.append("进群引导：{}".format("开" if enabled else "❌ 关着"))
+        lines.append("静默（只压制自动回话）：{}{}".format(
+            "开" if bool(getattr(self.config, "quiet_enabled", True)) else "关",
+            "，{} 秒".format(quiet) if quiet else "",
+        ))
         lines.append("判定方式：{}".format(_DETECT_LABELS.get(
             str(getattr(self.config, "welcome_detect", "notice") or "notice").lower(),
             getattr(self.config, "welcome_detect", "notice"))))
-        quiet_on = bool(getattr(self.config, "quiet_enabled", True))
-        lines.append("进群静默：{}（{} 秒）".format("开" if quiet_on else "❌ 关着", quiet))
-        live = {gid: left for gid, left in self._quiet.items() if left > 0}
+
+        lines.append("")
+        lines.append("【链接】")
+        lines.append("隧道：{}".format(
+            "在跑，地址 {}".format(self._tunnel.url or "（还没就绪）")
+            if self._tunnel.running() else "❌ 没跑"
+        ))
+        base = self._base_url()
+        lines.append("对外地址：{}".format(base or "❌ 没配（会退回发图鉴，不发死链）"))
+        if self._pending_link:
+            lines.append("待补发：{}（链接恢复后自动补）".format(
+                "、".join(sorted(self._pending_link)[:8])))
+
+        lines.append("")
+        lines.append("【检测】")
+        lines.append("群列表轮询：{}".format(
+            "开，已知 {} 个群".format(len(self._known_groups))
+            if (self._poller is not None and bool(getattr(self.config, "group_poll", True)))
+            else "❌ 没开"
+        ))
+        lines.append("已触发过的群：{} 个".format(len(self._seen_groups)))
+        if self._seen_groups:
+            lines.append("  " + "、".join(sorted(self._seen_groups)[:12]))
+            lines.append("  想让某群重新触发：/图鉴入群 允许 <群号>")
+        live = {g: s for g, s in self._quiet.items() if s > 0}
         if live:
             lines.append("静默进行中：{}".format(
-                "、".join("{}剩{:.0f}秒".format(g, s) for g, s in live.items())
-            ))
-        lines.append(
-            "已触发过的群：{} 个（重启后不再重复发）".format(len(self._seen_groups))
-        )
-        if self._seen_groups:
-            listed = "、".join(sorted(self._seen_groups)[:12])
-            more = " …" if len(self._seen_groups) > 12 else ""
-            lines.append("  " + listed + more)
-            lines.append("  想让某个群能重新触发：/图鉴入群 允许 <群号>")
-        named, problem = TunnelManager.named_status()
-        if problem:
-            lines.append("固定隧道：❗ " + problem)
-        else:
-            lines.append("固定隧道：{}".format(
-                "https://" + named if named else "未配置（用临时地址）"
-            ))
-        lines.append("隧道进程：{}".format("在跑" if self._tunnel.running() else "❌ 没跑"))
-        lines.append(
-            "群列表轮询：{}".format(
-                "开，已知 {} 个群".format(len(self._known_groups))
-                if (self._poller is not None and bool(getattr(self.config, "group_poll", True)))
-                else "❌ 没开"
-            )
-        )
-        lines.append("")
-        lines.append("框架配置检查：")
-        lines.extend("  " + item for item in self._framework_traps())
+                "、".join("{}剩{:.0f}秒".format(g, s) for g, s in live.items())))
+
         lines.append("")
         if self._recent:
-            lines.append("最近 10 条群事件：")
+            lines.append("【最近 10 条群事件】")
             for row in self._recent[-10:]:
-                lines.append(
-                    "  {} 群{}  {}{}".format(
-                        row["at"], row["group"], row["notice"],
-                        "（就是机器人自己）" if row["notice"] == "group_increase"
-                        and row["self"] else "",
-                    )
-                )
+                mark = ""
+                if row["notice"] == "group_increase" and row["self"]:
+                    mark = "（机器人自己）"
+                lines.append("  {} 群{}  {}{}".format(
+                    row["at"], row["group"], row["notice"], mark))
         else:
-            lines.append("⚠️ 一条群事件都没收到。")
-            lines.append("这说明框架在插件之前就把事件丢了，插件根本没机会看见。")
-            lines.append("最常见原因：那个群不在 AstrBot 的会话白名单里。")
-            lines.append("去面板 → 配置 → 会话白名单，把群号加进去，或把白名单开关关掉。")
-        if not bool(getattr(self.config, "welcome_enabled", True)):
-            lines.append("")
-            lines.append("入群欢迎是关着的，发 /图鉴入群 开 打开。")
+            lines.append("【❌ 一条群事件都没收到】")
+            lines.append("说明框架在插件之前就把事件丢了，插件根本没机会看见。")
+            lines.append("去面板 → 配置 → 会话白名单，把群号加进去，或关掉白名单。")
+
+        lines.append("")
+        lines.append("【框架配置】")
+        lines.extend("  " + item for item in self._framework_traps())
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)

@@ -81,26 +81,26 @@
         "default": ""
     },
     "welcome_enabled": {
-        "description": "入群引导",
-        "hint": "Bot 自己被拉进群时，发一条带链接的文本。\n发不出来时发 /图鉴诊断 看卡在哪（最常见是那个群不在会话白名单里）",
+        "description": "进群引导",
+        "hint": "机器人自己进群时，自动发一条带链接的文本",
         "type": "bool",
         "default": true
     },
     "welcome_text": {
-        "description": "入群引导语",
-        "hint": "{link} 会变成网页地址。默认不表明是机器人",
+        "description": "进群引导语",
+        "hint": "{link} 会替换成网页地址。默认不表明是机器人",
         "type": "string",
-        "default": "📎 会的事都写在这一页了，点开随便翻翻 👇\n{link}"
+        "default": "我到了，这页写着我都能做什么：\n{link}"
     },
     "welcome_quiet_seconds": {
-        "description": "入群静默秒数",
-        "hint": "进群后这段时间内不响应 LLM 调用（指令照常），防一群机器人同时触发。\n和「入群引导」是两个独立开关",
+        "description": "静默秒数",
+        "hint": "进群后这段时间不自动回话（防一群机器人抢话）。\n注意：只压制自动回复，指令一直能用。0 = 关掉",
         "type": "int",
         "default": 60
     },
     "welcome_detect": {
-        "description": "入群判定",
-        "hint": "选「仅允许进群时」＝只有收到进群通知才触发，最严格。\n选「两个都用」＝通知 + 群列表轮询都算，更不容易漏。\n选「仅陌生群」＝只认没见过的群号。选「关掉」＝不触发。\n群列表轮询由单独一项控制，不受这里影响",
+        "description": "进群判定方式",
+        "hint": "仅进群通知＝只认官方通知（最准）；\n通知 + 群列表＝两个都用（更不容易漏）；\n仅陌生群＝只认没见过的群；关掉＝不触发",
         "type": "string",
         "default": "notice"
     },
@@ -123,14 +123,14 @@
         "default": true
     },
     "quiet_enabled": {
-        "description": "进群静默",
-        "hint": "进群后这段时间内不响应 LLM（指令照常），防一群机器人同时触发。\n和「入群时发欢迎」是两个独立开关",
+        "description": "启用静默",
+        "hint": "关掉后进群也会正常回话。和「进群引导」是两个独立开关",
         "type": "bool",
         "default": true
     },
     "group_poll": {
-        "description": "群列表轮询（入群检测的可靠兜底）",
-        "hint": "每 25 秒拉一次「我当前在哪些群」，新出现的群就是刚被拉进去的。\n不依赖 OneBot 的进群通知——那个在某些实现上根本不上报。关掉就只剩通知和陌生群号两条路",
+        "description": "群列表轮询",
+        "hint": "每 8 秒看一次我在哪些群，用来补上「收不到进群通知」的情况。\n关掉就只靠通知，可能漏发",
         "type": "bool",
         "default": true
     }
