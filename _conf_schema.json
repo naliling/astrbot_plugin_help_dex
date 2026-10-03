@@ -70,7 +70,7 @@
     },
     "public_base_url": {
         "description": "对外访问地址",
-        "hint": "这一栏你不用管——发「/图鉴隧道 开」会自动填好。\n手动填的格式长这样（下面是示例，照格式换掉内容）：\nhttps://abc-def.trycloudflare.com\n或永久地址：https://help.你的域名.com\n别填 127.0.0.1 或内网地址，那样只有服务器自己能开。",
+        "hint": "这一栏你不用管——配好 cpolar 令牌后启动会自动拉起隧道并填好，进群时链接就是现成的。\n手动填的格式长这样（下面是示例，照格式换掉内容）：\nhttps://abc-def.r1.cpolar.cn\n或你自己的反代地址（插件不会动非 cpolar 地址）\n别填 127.0.0.1 或内网地址，那样只有服务器自己能开。",
         "type": "string",
         "default": ""
     },
@@ -117,8 +117,8 @@
         "default": []
     },
     "tunnel_autostart": {
-        "description": "启动时自动恢复固定隧道",
-        "hint": "配了固定地址（具名隧道）后，容器重启时自动拉起来，地址不变。关掉就得每次手动发 /图鉴隧道 开",
+        "description": "启动时自动拉隧道",
+        "hint": "容器重启时自动把 cpolar 隧道拉起来（前提是已经配过令牌：/图鉴隧道 令牌 <token>）。\n关掉后每次重启都得手动发 /图鉴隧道 开",
         "type": "bool",
         "default": true
     },

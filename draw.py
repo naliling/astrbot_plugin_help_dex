@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from .style import StyleStore
 
@@ -31,10 +31,30 @@ CELL_RADIUS = 10
 
 FOOTER_HEIGHT = 52
 
-BG_IMAGE_OVERLAY_ALPHA = 60
-LOGO_WHITE_THRESHOLD = 235
+BG_IMAGE_OVERLAY_ALPHA = 40
 GRID_STEP = 64
 GRID_COLOR = (110, 150, 200, 7)
+
+# 有背景图时的自适应字色：背景亮用深字、背景暗用亮字。
+# 这个只在「有背景图」或「用户没自定义过文字色」时生效。
+_DARK_TEXT = {
+    "标题": (12, 27, 51),
+    "副标题": (84, 101, 138),
+    "区块": (30, 47, 85),
+    "指令": (37, 99, 235),
+    "描述": (90, 107, 133),
+    "强调": (59, 130, 246),
+    "页脚": (135, 148, 179),
+}
+_LIGHT_TEXT = {
+    "标题": (244, 248, 255),
+    "副标题": (204, 216, 240),
+    "区块": (226, 236, 252),
+    "指令": (124, 184, 255),
+    "描述": (186, 200, 224),
+    "强调": (110, 170, 255),
+    "页脚": (168, 182, 208),
+}
 
 
 def _read_metadata_value(field: str) -> str:
@@ -50,9 +70,10 @@ def _read_metadata_value(field: str) -> str:
 
 
 class HelpImageRenderer:
-    def __init__(self, config, style: StyleStore):
+    def __init__(self, config, style: StyleStore, bot_id: Optional[str] = None):
         self.config = config
         self.style = style
+        self.bot_id = (str(bot_id).strip() or None) if bot_id is not None else None
         self.display_name = _read_metadata_value("display_name") or "指令图鉴"
         version = _read_metadata_value("version")
         self.version = version[1:] if version.lower().startswith("v") else version or "0.1.0"
@@ -75,6 +96,12 @@ class HelpImageRenderer:
 
     # -------------------- 素材 --------------------
     def _load_logo(self) -> Optional[Image.Image]:
+        """Logo 只做缩放：**不自动抠图**。
+
+        以前对不透明图自动去白底，结果白眼球、白色装饰也被一起抠掉，
+        看着很怪。现在只认「上传时本来就是透明底」的图（PNG 带真 alpha），
+        不透明图原样使用——该抠的人自己抠好再传。
+        """
         path = self.style.logo_path()
         if not path:
             return None
@@ -82,31 +109,9 @@ class HelpImageRenderer:
             logo = Image.open(path).convert("RGBA")
         except Exception:
             return None
-        if logo.mode == "RGB" or not self._has_real_alpha(logo):
-            logo = self._remove_near_white(logo)
         ow, oh = logo.size
         new_w = max(1, int(LOGO_HEIGHT * ow / oh))
         return logo.resize((new_w, LOGO_HEIGHT), Image.Resampling.LANCZOS)
-
-    @staticmethod
-    def _has_real_alpha(img: Image.Image) -> bool:
-        alpha = img.getchannel("A")
-        return alpha.getextrema()[0] < 250
-
-    @staticmethod
-    def _remove_near_white(img: Image.Image) -> Image.Image:
-        r, g, b, a = img.split()
-        threshold = LOGO_WHITE_THRESHOLD
-
-        def bright(channel):
-            return channel.point(lambda v: 255 if v >= threshold else 0)
-
-        white_mask = ImageChops.multiply(
-            ImageChops.multiply(bright(r), bright(g)), bright(b)
-        )
-        keep = ImageChops.subtract(a, white_mask)
-        img.putalpha(keep)
-        return img
 
     # -------------------- 排版辅助 --------------------
     @staticmethod
@@ -239,7 +244,7 @@ class HelpImageRenderer:
     # -------------------- 绘制 --------------------
     def _make_background(self, height: int) -> Image.Image:
         start, end = self.style.get_gradient()
-        bg_path = self.style.background_path()
+        bg_path = self.style.background_path(self.bot_id)
         if bg_path:
             try:
                 bg = Image.open(bg_path).convert("RGB")
@@ -250,9 +255,10 @@ class HelpImageRenderer:
                 left = (new_w - WIDTH) // 2
                 top = (new_h - height) // 2
                 canvas = bg.crop((left, top, left + WIDTH, top + height)).convert("RGBA")
-                # 蒙版颜色跟随主题明暗：暗色主题叠深色蒙版，浅色主题叠白色蒙版
-                luminance = 0.299 * start[0] + 0.587 * start[1] + 0.114 * start[2]
-                overlay_color = (255, 255, 255) if luminance >= 128 else (10, 16, 28)
+                # 蒙版颜色跟着**背景图自己的明暗**走（不是主题色的）：
+                # 亮图叠白、暗图叠深，这样卡片和白字都不会与背景打架。
+                luma = self._image_luminance(canvas)
+                overlay_color = (255, 255, 255) if luma >= 128 else (10, 16, 28)
                 overlay = Image.new(
                     "RGBA", canvas.size, overlay_color + (BG_IMAGE_OVERLAY_ALPHA,)
                 )
@@ -275,11 +281,42 @@ class HelpImageRenderer:
         canvas.alpha_composite(grid)
         return canvas
 
+    @staticmethod
+    def _image_luminance(img: Image.Image) -> float:
+        """缩到 1x1 求平均亮度——重采样会做好加权平均，比逐像素快得多。"""
+        pixel = img.convert("RGB").resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
+        return 0.299 * pixel[0] + 0.587 * pixel[1] + 0.114 * pixel[2]
+
     def _card_fill(self) -> Tuple[int, int, int, int]:
         r, g, b, a = self.style.get_color("卡片")
         if a >= 255:
             a = int(255 * self._card_opacity() / 100)
         return (r, g, b, a)
+
+    def _background_is_dark(self, img: Image.Image) -> bool:
+        """背景暗不暗——已经有背景图时由它决定字色该亮还是暗。
+
+        采样的位置避开卡片区域，只取顶部标题带：那里背景**没有**卡片遮挡，
+        看到的才是真正的背景色。
+        """
+        if not self.style.background_path(self.bot_id):
+            # 无背景图时看渐变底色
+            start, _ = self.style.get_gradient()
+            return (0.299 * start[0] + 0.587 * start[1] + 0.114 * start[2]) < 128
+        sample = img.crop((0, 0, WIDTH, max(20, self._header_height())))
+        return self._image_luminance(sample) < 128
+
+    def _adaptive_text(self, base_key: str, dark_bg: bool) -> Tuple[int, int, int]:
+        """背景暗就用亮色文字、背景亮就用深色文字。
+
+        用户只改颜色没设背景图时，保留他自己选的颜色，不要自作主张。
+        只有「背景图存在」或「用的是默认配色」才自动适配。
+        """
+        if self.style.colors.get(base_key) and not self.style.background_path(self.bot_id):
+            return self.style.get_color(base_key)[:3]
+        if dark_bg:
+            return _LIGHT_TEXT[base_key]
+        return _DARK_TEXT[base_key]
 
     def render(self, sections) -> bytes:
         ops, content_bottom = self._layout(sections)
@@ -287,7 +324,7 @@ class HelpImageRenderer:
 
         img = self._make_background(total_height)
         draw = ImageDraw.Draw(img)
-        has_bg = self.style.background_path() is not None
+        has_bg = self.style.background_path(self.bot_id) is not None
         card_fill = self._card_fill()
         chip_fill = (
             card_fill[0],
@@ -295,11 +332,33 @@ class HelpImageRenderer:
             card_fill[2],
             max(card_fill[3], 200),
         )
-
-        title_color = self.style.get_color("标题")[:3]
-        subtitle_color = self.style.get_color("副标题")[:3]
-        accent = self.style.get_color("强调")[:3]
-        accent_rgba = self.style.get_color("强调")
+        # 有背景图时，文字颜色跟着背景明暗自动适配；没有背景图时用用户选的/默认色
+        dark_bg = self._background_is_dark(img) if has_bg else False
+        if has_bg:
+            title_color = self._adaptive_text("标题", dark_bg)
+            subtitle_color = self._adaptive_text("副标题", dark_bg)
+            section_color = self._adaptive_text("区块", dark_bg)
+            cmd_color = self._adaptive_text("指令", dark_bg)
+            desc_color = self._adaptive_text("描述", dark_bg)
+            footer_color = self._adaptive_text("页脚", dark_bg)
+            accent = self._adaptive_text("强调", dark_bg)
+            accent_rgba = accent + (255,)
+        else:
+            title_color = self.style.get_color("标题")[:3]
+            subtitle_color = self.style.get_color("副标题")[:3]
+            section_color = self.style.get_color("区块")[:3]
+            cmd_color = self.style.get_color("指令")[:3]
+            desc_color = self.style.get_color("描述")[:3]
+            footer_color = self.style.get_color("页脚")[:3]
+            accent = self.style.get_color("强调")[:3]
+            accent_rgba = self.style.get_color("强调")
+        # 有背景图时卡片用半透明白，让背景透出来而不是一块硬色块
+        if has_bg:
+            card_alpha = max(120, min(210, int(255 * self._card_opacity() / 100)))
+            card_fill = (255, 255, 255, card_alpha) if not dark_bg else (18, 28, 48, card_alpha)
+            chip_fill = (255, 255, 255, max(card_alpha, 200)) if not dark_bg else (
+                18, 28, 48, max(card_alpha, 200)
+            )
 
         title_h = self._text_size(self.title_text, self.font_title)[1]
         subtitle_h = self._text_size(self.subtitle_text, self.font_subtitle)[1]
@@ -363,11 +422,12 @@ class HelpImageRenderer:
             )
         img.alpha_composite(divider)
 
-        # 区块与面板
-        section_color = self.style.get_color("区块")[:3]
+        # 区块与面板（字色已经在上面算过了，这里只取边框）
         border_color = self.style.get_color("边框")
-        cmd_color = self.style.get_color("指令")[:3]
-        desc_color = self.style.get_color("描述")[:3]
+        if has_bg and not dark_bg:
+            border_color = (201, 220, 247, 255)
+        elif has_bg and dark_bg:
+            border_color = (60, 80, 120, 255)
 
         for op in ops:
             if op["op"] == "section":
@@ -468,8 +528,9 @@ class HelpImageRenderer:
             return output.getvalue()
 
 
-def render_help_image(config, style: StyleStore, plugin_commands: Dict[str, List[dict]]) -> bytes:
-    renderer = HelpImageRenderer(config, style)
+def render_help_image(config, style: StyleStore, plugin_commands: Dict[str, List[dict]],
+                      bot_id: Optional[str] = None) -> bytes:
+    renderer = HelpImageRenderer(config, style, bot_id=bot_id)
     sections = _group_sections(config, plugin_commands)
     return renderer.render(sections)
 

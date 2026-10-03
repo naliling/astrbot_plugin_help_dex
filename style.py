@@ -6,21 +6,36 @@ from typing import Dict, List, Optional, Tuple
 
 _HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
 
-# 部位名 -> (默认值, 是否渐变双值)。默认为暗色科幻风：深空底 + 沉稳蓝青点缀
+# 部位名 -> (默认值, 是否渐变双值)。
+# 默认浅色亮蓝风：近白底 + 鲜艳蓝点缀，简洁不花哨。
 COLOR_KEYS: Dict[str, Tuple[List[str], bool]] = {
-    "背景": (["#0A0F1E", "#121D33"], True),
-    "标题": (["#D9E4F5"], False),
-    "副标题": (["#8CA0BE"], False),
-    "区块": (["#C6D6EC"], False),
-    "指令": (["#63BFE6"], False),
-    "描述": (["#93A8C6"], False),
-    "强调": (["#3E9BD6"], False),
-    "卡片": (["#16223A"], False),
-    "边框": (["#2C3D5C"], False),
-    "页脚": (["#71849F"], False),
+    "背景": (["#EEF5FF", "#D9E7FF"], True),
+    "标题": (["#0C1B33"], False),
+    "副标题": (["#54658A"], False),
+    "区块": (["#1E2F55"], False),
+    "指令": (["#2563EB"], False),
+    "描述": (["#5A6B85"], False),
+    "强调": (["#3B82F6"], False),
+    "卡片": (["#FFFFFF"], False),
+    "边框": (["#C9DCF7"], False),
+    "页脚": (["#8794B3"], False),
 }
 
 BACKGROUND_FILE = "background.img"
+
+
+def background_file_name(bot_id: Optional[str]) -> str:
+    """每个 bot 一份背景图：background-<bot>.img；全局背景是 background.img。
+
+    bot_id 只保留字母数字下划线连字符，其余字符剔除（防路径穿越）；
+    剔完为空就当全局处理。
+    """
+    if not bot_id:
+        return BACKGROUND_FILE
+    safe = re.sub(r"[^0-9A-Za-z_-]", "", str(bot_id))
+    if not safe:
+        return BACKGROUND_FILE
+    return f"background-{safe}.img"
 LOGO_FILE = "logo.img"
 STYLE_FILE = "style.json"
 
@@ -167,15 +182,43 @@ class StyleStore:
             return f"保存图片失败：{exc}"
         return None
 
-    def set_background(self, src: str) -> Optional[str]:
-        return self._store_image(src, BACKGROUND_FILE)
+    def set_background(self, src: str, bot_id: Optional[str] = None) -> Optional[str]:
+        """存背景图。bot_id 为空存全局（所有没单独设过的 bot 的兜底）。"""
+        return self._store_image(src, background_file_name(bot_id))
 
-    def background_path(self) -> Optional[Path]:
+    def background_path(self, bot_id: Optional[str] = None) -> Optional[Path]:
+        """取背景图。先看这个 bot 自己的，没有就回落到全局。"""
+        if bot_id:
+            path = self.data_dir / background_file_name(bot_id)
+            if path.is_file():
+                return path
         path = self.data_dir / BACKGROUND_FILE
         return path if path.is_file() else None
 
-    def clear_background(self) -> None:
+    def clear_background(self, bot_id: Optional[str] = None) -> bool:
+        """删背景图，返回是否真的删掉了。bot_id 为空删全局。"""
+        path = self.data_dir / background_file_name(bot_id)
+        if path.is_file():
+            path.unlink(missing_ok=True)
+            return True
+        return False
+
+    def list_bot_backgrounds(self) -> List[str]:
+        """已单独设过背景图的 bot 列表。"""
+        found = []
+        for path in sorted(self.data_dir.glob("background-*.img")):
+            found.append(path.name[len("background-"):-len(".img")])
+        return found
+
+    def has_any_background(self) -> bool:
+        return (self.data_dir / BACKGROUND_FILE).is_file() or bool(
+            self.list_bot_backgrounds()
+        )
+
+    def clear_all_backgrounds(self) -> None:
         (self.data_dir / BACKGROUND_FILE).unlink(missing_ok=True)
+        for path in self.data_dir.glob("background-*.img"):
+            path.unlink(missing_ok=True)
 
     def set_logo(self, src: str) -> Optional[str]:
         return self._store_image(src, LOGO_FILE)
@@ -192,5 +235,5 @@ class StyleStore:
         self.title_override = None
         self.subtitle_override = None
         self._save()
-        self.clear_background()
+        self.clear_all_backgrounds()
         self.clear_logo()

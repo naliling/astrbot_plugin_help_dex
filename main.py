@@ -39,10 +39,11 @@ from .page import (
     classify_base_url,
     describe_override,
     generate_access_key,
+    is_cpolar_url,
     parse_group_override,
     sanitize_access_key,
 )
-from .style import COLOR_KEYS, StyleStore
+from .style import COLOR_KEYS, StyleStore, background_file_name
 
 PLUGIN_NAME = "help_dex"
 
@@ -89,12 +90,13 @@ HELP_TEXT = """📖 指令图鉴
 
 管理：
 /图鉴背景 · /图鉴logo · /图鉴颜色 · /图鉴标题 · /图鉴简介 —— 换外观
+（发图给当前 bot 设专属背景；/图鉴背景 全局 + 图 给所有 bot 设默认）
 /图鉴重置 —— 外观全恢复默认
 /图鉴入群 开|关 —— 开关进群引导
 /图鉴静默 <秒> —— 进群后多久不回话，0 关（只压制自动回复，指令随时可用）
 /图鉴规则 <文字> —— 改网页顶部规则
 /图鉴链接 —— 看网页地址；加「换」换密钥
-/图鉴隧道 开|关|固定|登录 —— 开公网、固定地址
+/图鉴隧道 开|关 —— 开=公网隧道（cpolar，启动时也会自动开）；令牌 <token> 配一次就好
 /图鉴页面 [群号] —— 看某群网页配置
 /图鉴诊断 —— 排查进群不发链接
 
@@ -179,7 +181,7 @@ def _image_components(event: AstrMessageEvent) -> List[Image]:
     PLUGIN_NAME,
     "娜莉灵",
     "一条指令，把机器人会的一切画成一张暗色科幻风图鉴。群里@一下就发图；背景、Logo、配色想换就换，发张图发条指令秒生效，不用碰文件不用重启",
-    "0.5.5",
+    "0.6.0",
 )
 class HelpDexPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -196,10 +198,19 @@ class HelpDexPlugin(Star):
         self._probe_ok: Optional[bool] = None
         self._probed_at: float = 0.0
         self._recent: List[dict] = []
-        loaded_groups = self._load_known_groups()
+        loaded_groups, loaded_per_bot = self._load_known_groups()
         self._known_groups_initialized = loaded_groups is not None
         self._known_groups: set = loaded_groups or set()
+        # 同机多 Bot 的关键：群列表基线要按 bot 分开记。
+        # 群在 B 的列表里不代表对 A 是「已知群」——只有出现在 A 自己
+        # 那份列表里、且上一轮不在，才算「A 进了群」。
+        self._known_by_bot: Dict[str, set] = loaded_per_bot
+        # group -> 进群的 bot key。补发/发欢迎时，谁刚进群就该由谁开口。
+        self._join_via: Dict[str, str] = {}
+        # 实例对象 -> bot key 的缓存（get_login_info 每个实例只问一次）
+        self._inst_keys: Dict[int, str] = {}
         self._poller = None
+        self._tunnel_task: Optional[asyncio.Task] = None
         self._poll_ready = False
         self._last_poll_error = ""
         self._link_down_reason = ""
@@ -240,47 +251,55 @@ class HelpDexPlugin(Star):
             raw = str(getattr(self.config, "public_base_url", "") or "").strip()
             if raw:
                 logger.error("[help_dex] " + LOOPBACK_HINT)
-        await self._restore_tunnel(port)
+        # 隧道放后台拉：首次会自动下载 cpolar（十几 MB），网络不好要几分钟，
+        # 不能卡住插件加载；轮询与指令在这期间照常可用。
+        if self._tunnel_task is None or self._tunnel_task.done():
+            self._tunnel_task = asyncio.create_task(self._restore_tunnel(port))
 
     async def _restore_tunnel(self, port: int) -> None:
         """启动时把隧道拉回来——不然每次重启都必然「对外地址不可用」。
 
-        具名隧道优先：地址固定。
-        配的是临时地址就退而求其次，自动重开一个临时隧道——
-        **地址会变**，但至少入群时发出去的那条是能点开的，
-        总好过配置里躺着一个早就失效的地址、发出去就是死链。
+        换到 cpolar 后这里简单多了：token 在就行——
+        没 token 就什么都不做（等用户粘 token），有 token 就直接拉。
+        没装 cpolar 也不让用户管：当场自动下载安装。
+        免费版随机地址本来就会重置，拉起来会拿一个新地址写回配置。
+
+        这个函数跑在后台任务里，**整段包一层**：任何一个漏网异常
+        都会变成「Task exception was never retrieved」——不响、也没人管。
         """
-        if not TunnelManager.is_available():
-            return
+        try:
+            await self._restore_tunnel_inner(port)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"[help_dex] 隧道初始化异常（不影响其他功能）：{exc}")
+
+    async def _restore_tunnel_inner(self, port: int) -> None:
         if not bool(getattr(self.config, "tunnel_autostart", True)):
             logger.info("[help_dex] tunnel_autostart 是关的，启动时不自动拉隧道")
             return
+        if not TunnelManager.has_token():
+            return                      # 没 token，等用户 /图鉴隧道 令牌 <token>
         raw = str(getattr(self.config, "public_base_url", "") or "").strip()
-        if not self._base_url():
-            return                      # 没填地址，或填的是回环/内网
-        if TunnelManager.named_hostname():
-            logger.info("[help_dex] 检测到固定隧道配置，正在恢复…")
-            try:
-                url = await self._tunnel.start_named(port)
-            except Exception as exc:
-                logger.warning(f"[help_dex] 固定隧道自动拉起失败：{exc}")
-                return
-            logger.info(f"[help_dex] 固定隧道已恢复：{url}（地址永久不变）")
-        elif raw.endswith(".trycloudflare.com"):
-            logger.info("[help_dex] 检测到临时地址配置，正在自动重开临时隧道…")
-            try:
-                url = await self._tunnel.start_quick(port)
-            except Exception as exc:
-                logger.warning(f"[help_dex] 临时隧道自动拉起失败：{exc}")
-                return
-            if url != raw:
-                logger.info(
-                    f"[help_dex] 临时隧道地址已变：{raw} → {url}（临时地址本来就会变）"
-                )
-            logger.info(f"[help_dex] 临时隧道已恢复：{url}")
-        else:
-            logger.info("[help_dex] 对外地址不是 tunnel 域名，请自行确认反代指向本机端口")
+        if self._base_url() and not is_cpolar_url(raw):
+            # 用户自己配了反代/其他公网地址：不动它
+            logger.info("[help_dex] 对外地址不是 cpolar 隧道，请自行确认反代指向本机端口")
             return
+        if not TunnelManager.is_available():
+            logger.info("[help_dex] 没找到 cpolar，正在自动下载安装…")
+            try:
+                await TunnelManager.ensure_binary()
+            except Exception as exc:
+                logger.warning(f"[help_dex] cpolar 自动安装失败：{exc}")
+                return
+        logger.info("[help_dex] 正在拉起 cpolar 隧道…")
+        try:
+            url = await self._tunnel.start(port)
+        except Exception as exc:
+            logger.warning(f"[help_dex] cpolar 隧道自动拉起失败：{exc}")
+            return
+        if url != raw:
+            logger.info(f"[help_dex] cpolar 隧道地址已更新：{raw or '（无）'} → {url}")
         self.config["public_base_url"] = url
         self._save_config()
         self._probe_ok = None
@@ -290,6 +309,9 @@ class HelpDexPlugin(Star):
         if self._poller is not None:
             self._poller.cancel()
             self._poller = None
+        if self._tunnel_task is not None:
+            self._tunnel_task.cancel()
+            self._tunnel_task = None
         await self._tunnel.stop()
         if self.server is not None:
             await self.server.stop()
@@ -302,25 +324,44 @@ class HelpDexPlugin(Star):
         except Exception as exc:
             logger.warning(f"[help_dex] 保存配置失败: {exc}")
 
-    def _load_known_groups(self) -> Optional[set]:
+    def _load_known_groups(self) -> Tuple[Optional[set], Dict[str, set]]:
+        """群列表基线。两层：per_bot 那份驱动「哪个 bot 进了哪个群」，
+        并集只留给诊断看。旧文件没有 per_bot 键时返回空 dict——
+        首轮只建基线，不会误触发。"""
         try:
             raw = json.loads(
                 (self.data_dir / KNOWN_GROUPS_FILE).read_text(encoding="utf-8")
             )
         except FileNotFoundError:
-            return None
+            return None, {}
         except Exception:
-            return None
+            return None, {}
         known = raw.get("known") if isinstance(raw, dict) else None
         if not isinstance(known, list):
-            return None
-        return {str(item).strip() for item in known if str(item).strip()}
+            return None, {}
+        known_set = {str(item).strip() for item in known if str(item).strip()}
+        per_bot_raw = raw.get("per_bot") if isinstance(raw, dict) else None
+        per_bot: Dict[str, set] = {}
+        if isinstance(per_bot_raw, dict):
+            for key, groups in per_bot_raw.items():
+                if isinstance(groups, list):
+                    per_bot[str(key).strip()] = {
+                        str(g).strip() for g in groups if str(g).strip()
+                    }
+        return known_set, per_bot
 
     def _save_known_groups(self) -> None:
         try:
             (self.data_dir / KNOWN_GROUPS_FILE).write_text(
                 json.dumps(
-                    {"known": sorted(self._known_groups), "at": time.time()},
+                    {
+                        "known": sorted(self._known_groups),
+                        "per_bot": {
+                            key: sorted(groups)
+                            for key, groups in sorted(self._known_by_bot.items())
+                        },
+                        "at": time.time(),
+                    },
                     ensure_ascii=False, indent=2,
                 ),
                 encoding="utf-8",
@@ -332,13 +373,15 @@ class HelpDexPlugin(Star):
         manager = getattr(self.context, "platform_manager", None)
         return list(getattr(manager, "platform_insts", []) or []) if manager else []
 
-    async def _fetch_group_ids(self) -> Optional[set]:
-        """拉一次当前机器人在的群。拉不到返回 None，别当成空列表。"""
-        found: set = set()
-        reached = False
-        for inst in self._platform_instances():
+    async def _fetch_groups_per_instance(self) -> List[dict]:
+        """逐个 bot 拉群列表。拉不到的实例**不进结果**——
+        调用方保留它上一轮的基线，瞬时故障绝不能判成「退出了所有群」。
+        一个都没拉到时返回空列表，等价于旧的 None。"""
+        rows: List[dict] = []
+        for index, inst in enumerate(self._platform_instances()):
             bot = getattr(inst, "bot", None)
-            # CQHttp 两个版本分别提供 call_api / call_action，都得试
+            data: Optional[set] = None
+            error = ""
             for attr in ("call_api", "call_action"):
                 caller = getattr(bot, attr, None)
                 if not callable(caller):
@@ -355,22 +398,111 @@ class HelpDexPlugin(Star):
                             caller("get_group_list"), timeout=GROUP_POLL_TIMEOUT
                         )
                     except Exception as exc:
-                        self._last_poll_error = "{} 失败: {}".format(attr, exc)
+                        error = "{} 失败: {}".format(attr, exc)
                         continue
                 except Exception as exc:
-                    self._last_poll_error = "{} 失败: {}".format(attr, exc)
+                    error = "{} 失败: {}".format(attr, exc)
                     continue
                 data = self._parse_group_list(resp)
                 if data is None:
-                    self._last_poll_error = "{} 返回了看不懂的东西".format(attr)
+                    error = "{} 返回了看不懂的东西".format(attr)
                     continue
-                self._last_poll_error = ""
-                found |= data
-                reached = True
+                error = ""
                 break
-        if not reached and not self._last_poll_error:
+            if data is None:
+                if error and not self._last_poll_error:
+                    self._last_poll_error = error
+                continue
+            rows.append(
+                {
+                    "key": await self._bot_key_of(inst, index),
+                    "groups": data,
+                    "inst": inst,
+                }
+            )
+        if not rows and not self._last_poll_error:
             self._last_poll_error = "没有可用平台实例"
-        return found if reached else None
+        return rows
+
+    async def _bot_key_of(self, inst, index: int) -> str:
+        """bot 的稳定标识：get_login_info 的 QQ 号，重启后也认得出。
+        拿不到就用 平台名+序号 兜底——基线只是新建一次，
+        只多建基线、不会误触发。"""
+        cached = self._inst_keys.get(id(inst))
+        if cached:
+            return cached
+        key = ""
+        bot = getattr(inst, "bot", None)
+        for attr in ("call_api", "call_action"):
+            caller = getattr(bot, attr, None)
+            if not callable(caller):
+                continue
+            try:
+                resp = await asyncio.wait_for(
+                    caller("get_login_info"), timeout=GROUP_POLL_TIMEOUT
+                )
+                raw_data = resp.get("data") if isinstance(resp, dict) else None
+                user = raw_data.get("user_id") if isinstance(raw_data, dict) else None
+                key = str(user or "").strip()
+            except Exception:
+                continue
+            if key:
+                break
+        if not key:
+            key = "inst_{}_{}".format(self._platform_id(inst) or "?", index + 1)
+        self._inst_keys[id(inst)] = key
+        return key
+
+    async def _find_instance_by_key(self, key: Optional[str]):
+        if not key:
+            return None
+        for index, inst in enumerate(self._platform_instances()):
+            if await self._bot_key_of(inst, index) == key:
+                return inst
+        return None
+
+    async def _send_via_instance(self, inst, group_id: str, text: str) -> bool:
+        """从**这个 bot 自己的连接**直接发群消息。
+
+        框架的 context.send_message 会路由到「第一个成功的实例」：
+        两个 bot 同群时你控制不了哪张嘴开口——这正是「A 进群、B 说话」
+        的根源。直连 send_group_msg 才能保证欢迎语从刚进群的 bot 嘴里发出。
+        auto_escape=True：文本原样发出，不碰 CQ 码解析。
+        """
+        try:
+            gid = int(group_id)
+        except (TypeError, ValueError):
+            return False
+        bot = getattr(inst, "bot", None)
+        for attr in ("call_api", "call_action"):
+            caller = getattr(bot, attr, None)
+            if not callable(caller):
+                continue
+            try:
+                await asyncio.wait_for(
+                    caller(
+                        "send_group_msg",
+                        group_id=gid,
+                        message=text,
+                        auto_escape=True,
+                    ),
+                    timeout=15.0,
+                )
+                return True
+            except Exception as exc:
+                logger.warning(f"[help_dex] bot 直连发送失败({attr}): {exc}")
+                return False
+        return False
+
+    async def _fetch_group_ids(self) -> Optional[set]:
+        """所有 bot 的群并集。拉不到返回 None，别当成空列表。"""
+        rows = await self._fetch_groups_per_instance()
+        if not rows:
+            return None
+        found: set = set()
+        for row in rows:
+            found |= row["groups"]
+        return found
 
     @staticmethod
     def _parse_group_list(resp) -> Optional[set]:
@@ -415,7 +547,14 @@ class HelpDexPlugin(Star):
             "aiocqhttp:{}:{}".format(MessageType.GROUP_MESSAGE.value, group_id)
         ]
 
-    async def _send_to_group(self, group_id: str, text: str) -> bool:
+    async def _send_to_group(self, group_id: str, text: str,
+                             via_key: Optional[str] = None) -> bool:
+        # 优先从「刚进群的 bot」自己的连接发：多 bot 同群时
+        # 框架路由会让别的 bot 抢着开口。
+        if via_key:
+            inst = await self._find_instance_by_key(via_key)
+            if inst is not None and await self._send_via_instance(inst, group_id, text):
+                return True
         for umo in self._session_ums(group_id):
             try:
                 await self.context.send_message(umo, MessageChain([Plain(text)]))
@@ -424,18 +563,22 @@ class HelpDexPlugin(Star):
                 logger.warning(f"[help_dex] 主动发消息失败({umo}): {exc}")
         return False
 
-    async def _deliver_welcome(self, group_id: str) -> bool:
+    async def _deliver_welcome(self, group_id: str,
+                               via_key: Optional[str] = None) -> bool:
         """发一条引导。地址不可用时登记待补，不占用「已发」名额。
 
         关键：地址不可用不能 count 成“发过了”——如果那样，隧道之后恢复，
         这个群就永远收不到链接（旧实现就是这个毛病：发一句“稍后发”，
         然后再也不发）。所以只有真正发出链接才 claim 这个群。
+        via_key 是谁刚进群的 bot：它发占位语、发链接，都用它自己的嘴。
         """
         link = await self._resolve_link(group_id)
         if not link:
             if group_id not in self._pending_link:
                 self._pending_link.add(group_id)
-                await self._send_to_group(group_id, LINK_PENDING_TEXT)
+                if via_key:
+                    self._join_via[group_id] = via_key
+                await self._send_to_group(group_id, LINK_PENDING_TEXT, via_key=via_key)
                 logger.info(
                     f"[help_dex] 群 {group_id} 链接暂不可用，已登记待补发"
                 )
@@ -444,8 +587,10 @@ class HelpDexPlugin(Star):
             str(getattr(self.config, "welcome_text", "") or "").strip()
             or DEFAULT_WELCOME_TEXT
         )
-        await self._send_to_group(group_id, template.replace("{link}", link))
+        await self._send_to_group(group_id, template.replace("{link}", link),
+                                  via_key=via_key)
         self._pending_link.discard(group_id)
+        self._join_via.pop(group_id, None)
         return True
 
     async def _flush_pending_links(self) -> None:
@@ -460,53 +605,93 @@ class HelpDexPlugin(Star):
             link = await self._resolve_link(group_id)
             if not link:
                 continue
-            await self._send_to_group(group_id, template.replace("{link}", link))
+            via_key = self._join_via.get(group_id)
+            await self._send_to_group(group_id, template.replace("{link}", link),
+                                      via_key=via_key)
             self._pending_link.discard(group_id)
+            self._join_via.pop(group_id, None)
             logger.info(f"[help_dex] 已给群 {group_id} 补发链接")
 
-    async def _on_group_appeared(self, group_id: str) -> None:
-        """群列表里冒出一个新群 = 机器人被拉进去了。"""
-        logger.info(f"[help_dex] 群 {group_id} 新出现在机器人群列表里，按入群处理")
+    async def _on_group_appeared(self, group_id: str,
+                                 via_key: Optional[str] = None) -> None:
+        """某个 bot 的列表里冒出新群 = 那个 bot 被拉进去了。
+        via_key 是谁进的群；多 bot 同群时只有刚进的那个开口。"""
+        who = f"（bot {via_key}）" if via_key else ""
+        logger.info(f"[help_dex] 群 {group_id} 新出现在群列表里{who}，按入群处理")
         self._open_quiet(group_id)
         if not bool(getattr(self.config, "welcome_enabled", True)):
             return
         if not self._claim_group(group_id):
             return
-        await self._deliver_welcome(group_id)
+        if via_key:
+            self._join_via[group_id] = via_key
+        await self._deliver_welcome(group_id, via_key=via_key)
 
-    async def _apply_group_snapshot(self, current: set) -> None:
-        """应用一次成功获取的完整群列表。
+    async def _apply_group_snapshot(self, rows: List[dict]) -> None:
+        """应用一轮成功拉取。rows 里每个元素是某个 bot 的群列表。
 
-        首次成功读取才建立基线；首次请求失败不能消耗首轮状态，
-        否则第二次成功会把所有已有群误判成新群并群发欢迎。
+        首轮成功只建基线，绝不触发——否则一启动就给每个老群发欢迎。
+        本轮才首次出现的 bot（新登录/换了 key）也只建基线。
+        拉取失败的 bot 不在 rows 里：保留它上一轮的基线——
+        瞬时故障不能被误判成「退出了所有群」。
         """
         if not self._known_groups_initialized:
-            logger.info(f"[help_dex] 群列表基线：当前在 {len(current)} 个群")
-            self._known_groups = set(current)
+            for row in rows:
+                self._known_by_bot[row["key"]] = set(row["groups"])
+            summary = "、".join(
+                "{} {} 个群".format(row["key"], len(row["groups"])) for row in rows
+            ) or "没有实例"
+            logger.info(f"[help_dex] 群列表基线：{summary}")
             self._known_groups_initialized = True
+            self._known_groups = self._union_of(rows)
             self._save_known_groups()
             self._poll_ready = True
             return
 
-        departed = self._known_groups - current
-        arrived = current - self._known_groups
-        if departed:
-            for gid in departed:
-                self._forget_group(gid)
-            self._save_seen_groups()
-        for gid in sorted(arrived):
-            await self._on_group_appeared(gid)
-        self._known_groups = set(current)
+        for row in rows:
+            key = row["key"]
+            current = set(row["groups"])
+            prev = self._known_by_bot.get(key)
+            if prev is None:
+                logger.info(
+                    f"[help_dex] bot {key} 第一轮：建群基线（{len(current)} 个群），不触发"
+                )
+                self._known_by_bot[key] = current
+                continue
+            departed = prev - current
+            if departed:
+                for gid in departed:
+                    self._forget_group(gid)
+                self._save_seen_groups()
+            arrived = current - prev
+            self._known_by_bot[key] = current
+            for gid in sorted(arrived):
+                await self._on_group_appeared(gid, via_key=key)
+        fresh = {row["key"] for row in rows}
+        stale = {
+            gid
+            for key, groups in self._known_by_bot.items()
+            if key not in fresh
+            for gid in groups
+        }
+        self._known_groups = self._union_of(rows) | stale
         self._save_known_groups()
         self._poll_ready = True
+
+    @staticmethod
+    def _union_of(rows: List[dict]) -> set:
+        found: set = set()
+        for row in rows:
+            found |= row["groups"]
+        return found
 
     async def _group_poll_loop(self) -> None:
         await asyncio.sleep(GROUP_POLL_WARMUP)
         while True:
             try:
-                current = await self._fetch_group_ids()
-                if current is not None:
-                    await self._apply_group_snapshot(current)
+                rows = await self._fetch_groups_per_instance()
+                if rows:
+                    await self._apply_group_snapshot(rows)
                 await self._flush_pending_links()
             except asyncio.CancelledError:
                 raise
@@ -564,14 +749,22 @@ class HelpDexPlugin(Star):
         except Exception as exc:
             logger.warning(f"[help_dex] 保存群记录失败: {exc}")
 
-    def _render_image(self, commands: Optional[Dict[str, List[dict]]] = None) -> Optional[bytes]:
+    def _render_image(self, commands: Optional[Dict[str, List[dict]]] = None,
+                      bot_id: Optional[str] = None) -> Optional[bytes]:
         try:
             return render_help_image(
-                self.config, self.style, commands or self.collect_commands()
+                self.config, self.style, commands or self.collect_commands(),
+                bot_id=bot_id,
             )
         except Exception as exc:
             logger.error(f"[help_dex] 渲染帮助图失败: {exc}")
             return None
+
+    def _bot_id_for(self, event: AstrMessageEvent) -> Optional[str]:
+        """当前事件属于哪个 bot。取 self_id（QQ 号）当 bot 标识。"""
+        getter = getattr(event, "get_self_id", None)
+        value = str(getter() or "").strip() if callable(getter) else ""
+        return value or None
 
     def _public_commands(self) -> Dict[str, List[dict]]:
         """页面对公网开放，管理员指令一律不上页。
@@ -690,19 +883,19 @@ class HelpDexPlugin(Star):
         link = self._public_link(group_id)
         if not link:
             return None
-        # 存的是临时地址、但隧道进程根本没在跑：不用等探测也知道打不开。
-        # 这种情况很常见（重启后临时地址还在配置里，进程已经没了）。
+        # 存的是 cpolar 地址、但隧道进程根本没在跑：不用等探测也知道打不开。
+        # 非 cpolar 地址（用户自配反代等）不做这个判定——那种地址的生命周期
+        # 不归这里管。
         base = self._base_url()
-        if base.endswith(".trycloudflare.com") and not self._tunnel.running():
+        if is_cpolar_url(base) and not self._tunnel.running():
             self._probe_ok = False
             self._probed_at = time.time()
             self._link_down_reason = (
-                "配置里存的是临时地址，但隧道进程没在跑——"
-                "临时地址每次重启都会变，这是正常的。发 /图鉴隧道 开 会换一个。"
+                "隧道进程没在跑，稍等会自动拉起；也可以发 /图鉴隧道 开 看看。"
             )
             return None
         # 进程在跑但地址还没拿到（刚重开、还在握手）：此时发链接必然是死链
-        if base.endswith(".trycloudflare.com") and not self._tunnel.url:
+        if is_cpolar_url(base) and not self._tunnel.url:
             self._probe_ok = False
             self._probed_at = time.time()
             self._link_down_reason = "隧道刚重开、地址还没就绪，稍等几秒再试。"
@@ -814,7 +1007,7 @@ class HelpDexPlugin(Star):
         yield event.plain_result(
             "⚠️ 对外地址不可用，这次退回发图鉴（和真实入群时行为一致）。"
         )
-        image = self._render_image()
+        image = self._render_image(bot_id=self._bot_id_for(event))
         if image:
             yield event.chain_result([Image.fromBytes(image)])
         else:
@@ -866,11 +1059,14 @@ class HelpDexPlugin(Star):
             )
             return
         logger.info(f"[help_dex] 群 {group_id} 触发入群引导")
-        if await self._deliver_welcome(group_id):
+        # 事件上的 self_id 就是「刚进群的 bot」。欢迎语必须从那 bot 自己嘴里发，
+        # 不能让同机另一个 bot 替它开口。
+        via_key = str(event.get_self_id() or "").strip() or None
+        if await self._deliver_welcome(group_id, via_key=via_key):
             return
         # 链接还没就绪：已登记待补发（轮询和隧道就绪时都会自动补），
         # 同时先把图鉴图片发出去，不让人干等。
-        image = self._render_image()
+        image = self._render_image(bot_id=self._bot_id_for(event))
         if image:
             await self._announce(event, None, image)
         else:
@@ -930,7 +1126,7 @@ class HelpDexPlugin(Star):
         if not self.collect_commands():
             yield event.plain_result("暂时没有收集到任何指令，先确认装了别的插件再试试～")
             return
-        image = self._render_image()
+        image = self._render_image(bot_id=self._bot_id_for(event))
         if image is None:
             yield event.plain_result("图鉴绘制失败了，请看后台日志排查。")
         else:
@@ -951,7 +1147,7 @@ class HelpDexPlugin(Star):
         """
         if not self.collect_commands():
             return
-        image = self._render_image()
+        image = self._render_image(bot_id=self._bot_id_for(event))
         if image is None:
             return
         yield event.chain_result([Image.fromBytes(image)])
@@ -962,12 +1158,12 @@ class HelpDexPlugin(Star):
         if not self.collect_commands():
             yield event.plain_result("暂时没有收集到任何指令，先确认装了别的插件再试试～")
             return
-        image = self._render_image()
+        image = self._render_image(bot_id=self._bot_id_for(event))
         if image is None:
             yield event.plain_result("图鉴绘制失败了，请看后台日志排查。")
             return
         yield event.chain_result([Image.fromBytes(image)])
-        yield event.plain_result(self._style_status())
+        yield event.plain_result(self._style_status(self._bot_id_for(event)))
 
     @filter.command("图鉴帮助")
     async def plugin_help(self, event: AstrMessageEvent):
@@ -978,21 +1174,59 @@ class HelpDexPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("图鉴背景")
     async def set_background(self, event: AstrMessageEvent):
-        """上传/重置帮助图背景图（管理员）"""
+        """上传/重置帮助图背景图（管理员）
+
+        三种用法：
+        - 直接发图/图链：只给「当前这个 bot」设背景
+        - /图鉴背景 全局 + 图：给所有 bot 设默认背景
+        - /图鉴背景 重置：删当前 bot 的；后面跟「全局」则删全局的
+        """
         arg = _arg_after(event.message_str, "图鉴背景")
+        current_bot = self._bot_id_for(event)
         if arg in ("重置", "复位", "删除"):
-            self.style.clear_background()
-            yield event.plain_result("✅ 背景图已移除，恢复默认渐变背景。")
+            removed = self.style.clear_background(current_bot)
+            if removed:
+                yield event.plain_result(
+                    "✅ 本 bot（{}）的专属背景图已移除。".format(current_bot or "?")
+                )
+            else:
+                yield event.plain_result(
+                    "本 bot 没单独设置过背景图，没什么可重置的。\n"
+                    "（想删全局默认背景：/图鉴背景 重置 全局）"
+                )
             return
+        if arg in ("重置 全局", "复位 全局", "删除 全局", "重置全局", "全局重置"):
+            removed = self.style.clear_background(None)
+            if removed:
+                yield event.plain_result("✅ 全局默认背景图已移除。")
+            else:
+                yield event.plain_result("本来就没设过全局背景图。")
+            return
+        target_bot: Optional[str] = current_bot
+        if arg in ("全局", "默认") or arg.startswith(("全局 ", "默认 ")):
+            target_bot = None
+            arg = arg[len("全局"):].strip() if arg.startswith("全局") else arg[len("默认"):].strip()
+        elif arg.startswith("重置"):
+            pass  # 上面的精确匹配已经处理了
         source, error = await self._resolve_image_source(event, arg, "图鉴背景")
         if error:
             yield event.plain_result(error)
             return
-        error = self.style.set_background(source)
+        error = self.style.set_background(source, bot_id=target_bot)
         if error:
             yield event.plain_result(f"❌ {error}")
             return
-        yield event.plain_result("✅ 背景图已更新，发 /帮助图鉴 看看效果～")
+        if target_bot:
+            yield event.plain_result(
+                f"✅ 背景图已更新（只对 bot {target_bot} 生效）。\n"
+                "发 /帮助图鉴 看看效果～\n"
+                "想给所有 bot 用同一张：发 /图鉴背景 全局 + 图片。"
+            )
+        else:
+            yield event.plain_result(
+                "✅ 全局默认背景图已更新（所有没单独设过的 bot 都会用它）。\n"
+                "发 /帮助图鉴 看看效果～"
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("图鉴logo")
@@ -1011,7 +1245,10 @@ class HelpDexPlugin(Star):
         if error:
             yield event.plain_result(f"❌ {error}")
             return
-        yield event.plain_result("✅ Logo 已更新（白底会自动抠掉），发 /帮助图鉴 看看效果～")
+        yield event.plain_result(
+                "✅ Logo 已更新，发 /帮助图鉴 看看效果～\n"
+                "（透明底 PNG 效果最好；不透明的图会原样使用，不会自动抠）"
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("图鉴颜色")
@@ -1220,10 +1457,18 @@ class HelpDexPlugin(Star):
         base = self._base_url()
         if base and self._probe_ok:
             return ""
-        head = "\n\n修好只要一条指令：发 /图鉴隧道 开，它会拉一个真隧道并把地址换成真的。"
-        if TunnelManager.is_available():
-            return head
-        return head + "（现在容器里没装 cloudflared，指令里会给出安装命令）"
+        if not TunnelManager.is_available():
+            return (
+                "\n\n发 /图鉴隧道 开 就行：没装 cpolar 会自动下载安装，"
+                "缺什么都它自己补。"
+            )
+        if not TunnelManager.has_token():
+            return (
+                "\n\n修好只要两步：去 https://www.cpolar.com 注册（免费），"
+                "把后台「验证」页的 authtoken 发过来：/图鉴隧道 令牌 <token>。\n"
+                "（不用绑卡、不用浏览器授权、不用域名）"
+            )
+        return "\n\n修好只要一条指令：发 /图鉴隧道 开，它会拉起 cpolar 隧道并把地址换好。"
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("图鉴链接")
@@ -1276,9 +1521,9 @@ class HelpDexPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("图鉴隧道")
     async def tunnel(self, event: AstrMessageEvent):
-        """开/关公网隧道，以及切到固定地址（管理员）
+        """开/关公网隧道，配 cpolar token（管理员）
 
-        开/关/固定都是把欢迎页暴露到公网，只认管理员手动下令。
+        开/关/配 token 都是把欢迎页暴露到公网，只认管理员手动下令。
         """
         arg = _arg_after(event.message_str, "图鉴隧道")
         if arg in ("关", "关闭", "off", "停止", "停"):
@@ -1292,17 +1537,30 @@ class HelpDexPlugin(Star):
                 "现在入群发的是图鉴图片。"
             )
             return
-        if arg in ("登录", "login"):
-            yield event.plain_result(await self._tunnel_login())
-            return
-        if arg.startswith("固定"):
-            hostname = arg[len("固定"):].strip()
-            for token in (" ", "："):
-                hostname = hostname.replace(token, " ").strip()
-            hostname = hostname.split()[0] if hostname else ""
-            text = await self._tunnel_named(hostname)
-            for line in text:
-                yield event.plain_result(line)
+        if arg.startswith(("令牌", "token", "Token")):
+            rest = arg[len("令牌"):].strip() if arg.startswith("令牌") else arg[5:].strip()
+            for sep in ("=", "：", ":"):
+                if rest.startswith(sep):
+                    rest = rest[len(sep):].strip()
+            rest = rest.split()[0] if rest.split() else ""
+            if not rest:
+                yield event.plain_result(self._token_guide_text())
+                return
+            try:
+                TunnelManager.set_token(rest)
+            except TunnelError as exc:
+                yield event.plain_result(f"❌ {exc}")
+                return
+            yield event.plain_result("✅ token 已保存。")
+            # 顺手直接把隧道拉起来——用户贴 token 的意图就是要用，
+            # 不该再让他多发一条指令。服务没就绪时不算失败：启动后会自动拉起。
+            if self.server is None:
+                yield event.plain_result(
+                    "欢迎页服务没在跑（page_enabled 关着），重新加载插件后会自动拉起隧道。"
+                )
+                return
+            async for line in self._start_tunnel_flow(event):
+                yield line
             return
         if not arg or arg not in ("开", "开启", "on", "启动", "起"):
             yield event.plain_result(self._tunnel_status_text())
@@ -1310,13 +1568,20 @@ class HelpDexPlugin(Star):
         if self.server is None:
             yield event.plain_result("⚠️ 欢迎页服务没跑起来，先把 page_enabled 打开。")
             return
-        if not TunnelManager.is_available():
-            yield event.plain_result("❌ " + INSTALL_HINT)
+        if not TunnelManager.has_token():
+            yield event.plain_result(self._token_guide_text())
             return
-        named = TunnelManager.named_hostname()
-        yield event.plain_result(
-            "正在拉起{}隧道，最多等 30 秒…".format("固定" if named else "临时")
-        )
+        async for line in self._start_tunnel_flow(event):
+            yield line
+
+    async def _start_tunnel_flow(self, event: AstrMessageEvent):
+        """拉起隧道 + 探测 + 回写配置。供「令牌」「开」两条路复用。"""
+        if TunnelManager.is_available():
+            yield event.plain_result("正在拉起 cpolar 隧道，最多等 45 秒…")
+        else:
+            yield event.plain_result(
+                "首次运行：正在自动下载安装 cpolar 并拉起隧道，最多等一两分钟…"
+            )
         try:
             url = await self._tunnel.start(self.server.port)
         except TunnelError as exc:
@@ -1332,95 +1597,44 @@ class HelpDexPlugin(Star):
         self._probed_at = 0.0
         link = await self._resolve_link(force=True)
         if link:
-            if self._tunnel.mode == "named":
-                yield event.plain_result(
-                    f"✅ 固定地址已就绪：\n{url}\n\n{self._tunnel_status_text()}"
-                )
-            else:
-                yield event.plain_result(
-                    f"✅ 临时地址已就绪：\n{url}\n\n{self._tunnel_status_text()}\n"
-                    "⚠️ 临时地址重启就变，群里发过的旧链接会失效。\n"
-                    "想要永久固定：发 /图鉴隧道 固定 help.你的域名.com"
-                )
+            yield event.plain_result(
+                f"✅ 地址已就绪：\n{url}\n\n{self._tunnel_status_text()}"
+            )
         else:
             yield event.plain_result(
                 f"⚠️ 隧道起来了，但探测不通：{url}\n"
                 "过一会儿发 /图鉴链接 再试。"
             )
 
-    async def _tunnel_login(self) -> str:
-        if not TunnelManager.is_available():
-            return "❌ " + INSTALL_HINT
-        if TunnelManager.has_cert():
-            return "✅ 这台机器已经登录过 cloudflare 了，直接发 /图鉴隧道 固定 <域名> 就行。"
-        try:
-            url = await self._tunnel.begin_login()
-        except TunnelError as exc:
-            return f"❌ {exc}"
+    @staticmethod
+    def _token_guide_text() -> str:
         return (
-            "下面这个链接需要你在**浏览器**里点一下授权（一次性的）：\n\n"
-            f"{url}\n\n"
-            "点完之后回来发 /图鉴隧道 固定 help.你的域名.com 继续。\n"
-            "（授权必须在你自己的手机或电脑上点，容器里没有浏览器）"
+            "📝 就差一步：把 cpolar 的 token 粘进来。\n"
+            "\n"
+            "1. 手机或电脑打开 https://www.cpolar.com 注册（免费，邮箱就行）\n"
+            "2. 登录后找左侧「验证」页，复制那串 authtoken\n"
+            "3. 回来发：/图鉴隧道 令牌 <粘上那串>\n"
+            "\n"
+            "以后就全自动了：启动自动拉、地址变了自动补，不用再碰。\n"
+            "免费版：1Mbps 带宽，地址会周期性重置（插件会自动适配）。"
         )
-
-    async def _tunnel_named(self, hostname: str) -> List[str]:
-        if self.server is None:
-            return ["⚠️ 欢迎页服务没跑起来，先把 page_enabled 打开。"]
-        if not TunnelManager.is_available():
-            return ["❌ " + INSTALL_HINT]
-        if not hostname:
-            return [
-                "用法：/图鉴隧道 固定 help.你的域名.com",
-                "这个域名要先托管在 Cloudflare（NS 指向 Cloudflare），"
-                "然后一条指令就能建好，地址永久固定。",
-            ]
-        if not TunnelManager.has_cert():
-            return [
-                "还没登录过 cloudflare 账号。",
-                "先发 /图鉴隧道 登录，在弹出来的链接上点一下授权。",
-            ]
-        yield_msg = "正在建隧道并把 {} 指过来…".format(hostname)
-        try:
-            await self._tunnel.stop()
-            result = await self._tunnel.create_named(hostname, self.server.port)
-        except TunnelError as exc:
-            return [yield_msg, f"❌ {exc}"]
-        self.config["public_base_url"] = "https://" + result
-        self._save_config()
-        self._probe_ok = None
-        self._probed_at = 0.0
-        url = await self._tunnel.start(self.server.port)
-        self.config["public_base_url"] = url
-        self._save_config()
-        link = await self._resolve_link(force=True)
-        tail = "✅ 固定地址可用，群里那条旧链接从此不会再失效。" if link else (
-            "⚠️ 隧道建好了但探测不通，过一会儿发 /图鉴链接 再试。"
-        )
-        return [yield_msg, f"地址：{url}", tail, self._tunnel_status_text()]
 
     def _tunnel_status_text(self) -> str:
-        named, problem = TunnelManager.named_status()
-        lines = ["🚇 隧道状态："]
+        token, problem = TunnelManager.token_status()
+        lines = ["🚇 隧道状态（cpolar）："]
         if problem:
             lines.append("❗ " + problem)
         if not TunnelManager.is_available():
-            lines.append("容器里没装 cloudflared")
-            lines.append(INSTALL_HINT)
+            lines.append("cpolar 还没装——不用管，发 /图鉴隧道 开 时会自动下载安装。")
         elif self._tunnel.running() and self._tunnel.url:
-            kind = "固定" if self._tunnel.mode == "named" else "临时"
-            lines.append(f"运行中（{kind}）：{self._tunnel.url}")
-        elif named:
-            lines.append(f"已配置固定地址但没在跑：https://{named}")
-            lines.append("发 /图鉴隧道 开 拉起来。容器重启后插件会自动恢复。")
+            lines.append(f"运行中：{self._tunnel.url}")
         else:
             lines.append("没开")
-        if named:
-            lines.append(f"\n固定地址：https://{named}（永久不变）")
+        if token:
+            masked = token[:4] + "…" + token[-4:] if len(token) > 10 else "已配置"
+            lines.append(f"\ntoken：{masked}（已保存）")
         else:
-            lines.append(
-                "\n想要永久固定的地址：发 /图鉴隧道 固定 help.你的域名.com"
-            )
+            lines.append("\ntoken：❌ 还没配 /图鉴隧道 令牌 <token>")
         lines.append("\n开：/图鉴隧道 开　关：/图鉴隧道 关")
         lines.append("⚠️ 开隧道等于把欢迎页开到全互联网（带密钥），链接在群里发过就能被转发。")
         lines.append("隧道只指欢迎页端口，不碰面板 6185。")
@@ -1488,18 +1702,30 @@ class HelpDexPlugin(Star):
                 callable(getattr(bot, "call_api", None)),
                 callable(getattr(bot, "call_action", None)),
             ))
-        groups = await self._fetch_group_ids()
-        if groups is None:
+        rows = await self._fetch_groups_per_instance()
+        if not rows:
             lines.append("")
             lines.append("❌ 拉不到群列表：{}".format(
                 self._last_poll_error or "原因不明"
             ))
             lines.append("入群检测现在只剩通知和陌生群号两条路了。")
         else:
+            groups = set()
+            for row in rows:
+                groups |= row["groups"]
             lines.append("")
-            lines.append("✅ 拉到了，当前在 {} 个群：{}".format(
-                len(groups), "、".join(sorted(groups)[:20]) or "（空）"
+            lines.append("✅ 拉到了，当前在 {} 个群（{} 个 bot）：{}".format(
+                len(groups), len(rows), "、".join(sorted(groups)[:20]) or "（空）"
             ))
+            if len(rows) > 1:
+                lines.append("多 bot：各自记基线，谁进群由谁发欢迎：")
+                for row in rows:
+                    lines.append(
+                        "  bot {}：{} 个群 {}".format(
+                            row["key"], len(row["groups"]),
+                            "、".join(sorted(row["groups"])[:12]) or "（无群）",
+                        )
+                    )
             fresh = groups - self._known_groups
             if self._known_groups:
                 lines.append("基线里有 {} 个群，比对差集：{}".format(
@@ -1673,12 +1899,25 @@ class HelpDexPlugin(Star):
         return path
 
     # -------------------- 样式状态 --------------------
-    def _style_status(self) -> str:
+    def _style_status(self, bot_id: Optional[str] = None) -> str:
         lines = ["🎨 当前图鉴自定义状态："]
-        customized = bool(self.style.colors) or self.style.background_path() or self.style.logo_path()
-        lines.append(
-            f"背景图：{'已设置' if self.style.background_path() else '未设置（默认渐变）'}"
-        )
+        own_bg = bool(bot_id) and (self.style.data_dir / background_file_name(bot_id)).is_file()
+        global_bg = (self.style.data_dir / "background.img").is_file()
+        customized = bool(self.style.colors) or self.style.has_any_background() or self.style.logo_path()
+        if bot_id:
+            if own_bg:
+                lines.append(f"背景图：本 bot（{bot_id}）有专属背景")
+            elif global_bg:
+                lines.append(f"背景图：本 bot 用全局背景（发图可直接给本 bot 设专属的）")
+            else:
+                lines.append("背景图：未设置（默认浅色渐变）")
+        else:
+            lines.append(
+                "背景图：{}".format("已设置全局默认" if global_bg else "未设置（默认浅色渐变）")
+            )
+        others = [b for b in self.style.list_bot_backgrounds() if b != bot_id]
+        if others:
+            lines.append("其他 bot 的专属背景：{} 个".format(len(others)))
         lines.append(f"Logo：{'已设置' if self.style.logo_path() else '未设置'}")
         changed = [key for key in COLOR_KEYS if key in self.style.colors]
         lines.append(f"自定义颜色：{('、'.join(changed)) if changed else '无'}")
