@@ -1,5 +1,23 @@
 # 更新日志
 
+## v0.6.1
+
+### 修：page.py 改用 AstrBot 的 logger（上架审查要求）
+
+上架自动安全检查未通过，唯一原因是日志规范违规：page.py 用了 Python 内置
+`logging` 模块并自建记录器（`logger = logging.getLogger("help_dex.page")`）。
+规范要求 logger 必须且只能从 `astrbot.api` 导入。现已改为：
+
+```python
+from astrbot.api import logger
+```
+
+全项目（main.py / page.py）现在都统一使用 astrbot 的 logger，
+不再有任何内置 logging 或第三方日志库。
+
+测试同步调整：测试文件里对 page 的模块级导入移到用例内延迟导入
+（page 现在依赖 astrbot.api，需要等测试桩安装后再加载）。
+
 ## v0.6.0
 
 ### 加：每个 bot 可以有自己的背景图

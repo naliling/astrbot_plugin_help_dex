@@ -16,7 +16,6 @@ import asyncio
 import base64
 import io
 import json
-import logging
 import os
 import platform
 import re
@@ -34,8 +33,8 @@ from urllib.parse import quote, urlsplit
 import aiohttp
 from aiohttp import web
 
-# page.py 是独立层：不依赖 astrbot 的任何模块（测试/工具箱能单独 import）。
-logger = logging.getLogger("help_dex.page")
+# 日志必须走 AstrBot 的 logger（上架规范要求：不用内置 logging、不自建记录器）。
+from astrbot.api import logger
 
 from .draw import HelpImageRenderer, _group_sections, _read_metadata_value
 from .style import StyleStore
