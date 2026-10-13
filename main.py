@@ -62,14 +62,15 @@ GROUP_POLL_INTERVAL = 8.0
 GROUP_POLL_WARMUP = 2.0
 GROUP_POLL_TIMEOUT = 15.0
 
+# 群从某个 bot 的列表里消失后，连续几轮都不在才判定「真退出」。
+# 单轮缺失多半是那一次拉取返回不全；立刻忘记去重状态会让群再出现时重发欢迎。
+GROUP_LEAVE_STREAK = 3
+
 _DETECT_LABELS = {"notice": "仅进群通知", "both": "通知 + 群列表",
                    "unknown": "仅陌生群", "off": "关掉"}
 
 # 默认引导语：不表明是机器人，不放表情包堆砌，把链接单独一行。
 DEFAULT_WELCOME_TEXT = "我到了，这页写着我都能做什么：\n{link}"
-
-# 链接暂时不可用时的占位引导。不能让人以为它就是最终那条链接。
-LINK_PENDING_TEXT = "我到了，正在准备说明书，稍后发上来。"
 
 # 探测对外地址：太短会误判成不通，太长会把入群卡住
 PROBE_TIMEOUT = 3.5
@@ -177,11 +178,21 @@ def _image_components(event: AstrMessageEvent) -> List[Image]:
         return []
 
 
+def _discard_temp(path: Optional[str]) -> None:
+    """删掉下载到临时目录的图片；不存在或删不掉都不当回事。"""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 @register(
     PLUGIN_NAME,
     "娜莉灵",
     "一条指令，把机器人会的一切画成一张暗色科幻风图鉴。群里@一下就发图；背景、Logo、配色想换就换，发张图发条指令秒生效，不用碰文件不用重启",
-    "0.6.1",
+    "0.6.2",
 )
 class HelpDexPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -192,7 +203,6 @@ class HelpDexPlugin(Star):
         self.server: Optional[PageServer] = None
         self._tunnel = TunnelManager(on_url_changed=self._on_tunnel_url_changed)
         self._quiet: Dict[str, float] = {}
-        self._pending_link: set = set()
         self._seen_groups = self._load_seen_groups()
         self._fired_groups: set = set()
         self._probe_ok: Optional[bool] = None
@@ -205,8 +215,9 @@ class HelpDexPlugin(Star):
         # 群在 B 的列表里不代表对 A 是「已知群」——只有出现在 A 自己
         # 那份列表里、且上一轮不在，才算「A 进了群」。
         self._known_by_bot: Dict[str, set] = loaded_per_bot
-        # group -> 进群的 bot key。补发/发欢迎时，谁刚进群就该由谁开口。
-        self._join_via: Dict[str, str] = {}
+        # (bot key, 群号) -> 连续多少轮不在这个 bot 的列表里。用来区分
+        # 「真退出」和「某一次拉取返回不全」，后者不该重发欢迎。
+        self._missing_rounds: Dict[Tuple[str, str], int] = {}
         # 实例对象 -> bot key 的缓存（get_login_info 每个实例只问一次）
         self._inst_keys: Dict[int, str] = {}
         self._poller = None
@@ -491,7 +502,7 @@ class HelpDexPlugin(Star):
                 return True
             except Exception as exc:
                 logger.warning(f"[help_dex] bot 直连发送失败({attr}): {exc}")
-                return False
+                continue
         return False
 
     async def _fetch_group_ids(self) -> Optional[set]:
@@ -563,25 +574,27 @@ class HelpDexPlugin(Star):
                 logger.warning(f"[help_dex] 主动发消息失败({umo}): {exc}")
         return False
 
+    async def _send_image_to_group(self, group_id: str, image: bytes) -> bool:
+        """发一张图到群（入群兜底用）。发送失败只记日志，不重试。"""
+        chain = MessageChain([Image.fromBytes(image)])
+        for umo in self._session_ums(group_id):
+            try:
+                await self.context.send_message(umo, chain)
+                return True
+            except Exception as exc:
+                logger.warning(f"[help_dex] 主动发图失败({umo}): {exc}")
+        return False
+
     async def _deliver_welcome(self, group_id: str,
                                via_key: Optional[str] = None) -> bool:
-        """发一条引导。地址不可用时登记待补，不占用「已发」名额。
+        """发一条带链接的入群引导。链接不可用就返回 False。
 
-        关键：地址不可用不能 count 成“发过了”——如果那样，隧道之后恢复，
-        这个群就永远收不到链接（旧实现就是这个毛病：发一句“稍后发”，
-        然后再也不发）。所以只有真正发出链接才 claim 这个群。
-        via_key 是谁刚进群的 bot：它发占位语、发链接，都用它自己的嘴。
+        发不出去就是发不出去：不登记、不重试、不补发。调用方拿到 False
+        会改用图鉴图片兜底，兜底也发不出去就只记一条日志。
+        via_key 是谁刚进群的 bot：从它自己的嘴开口。
         """
         link = await self._resolve_link(group_id)
         if not link:
-            if group_id not in self._pending_link:
-                self._pending_link.add(group_id)
-                if via_key:
-                    self._join_via[group_id] = via_key
-                await self._send_to_group(group_id, LINK_PENDING_TEXT, via_key=via_key)
-                logger.info(
-                    f"[help_dex] 群 {group_id} 链接暂不可用，已登记待补发"
-                )
             return False
         template = (
             str(getattr(self.config, "welcome_text", "") or "").strip()
@@ -589,28 +602,7 @@ class HelpDexPlugin(Star):
         )
         await self._send_to_group(group_id, template.replace("{link}", link),
                                   via_key=via_key)
-        self._pending_link.discard(group_id)
-        self._join_via.pop(group_id, None)
         return True
-
-    async def _flush_pending_links(self) -> None:
-        """隧道就绪后，把之前没发成链接的群补上。"""
-        if not self._pending_link:
-            return
-        template = (
-            str(getattr(self.config, "welcome_text", "") or "").strip()
-            or DEFAULT_WELCOME_TEXT
-        )
-        for group_id in sorted(self._pending_link):
-            link = await self._resolve_link(group_id)
-            if not link:
-                continue
-            via_key = self._join_via.get(group_id)
-            await self._send_to_group(group_id, template.replace("{link}", link),
-                                      via_key=via_key)
-            self._pending_link.discard(group_id)
-            self._join_via.pop(group_id, None)
-            logger.info(f"[help_dex] 已给群 {group_id} 补发链接")
 
     async def _on_group_appeared(self, group_id: str,
                                  via_key: Optional[str] = None) -> None:
@@ -623,9 +615,11 @@ class HelpDexPlugin(Star):
             return
         if not self._claim_group(group_id):
             return
-        if via_key:
-            self._join_via[group_id] = via_key
-        await self._deliver_welcome(group_id, via_key=via_key)
+        if await self._deliver_welcome(group_id, via_key=via_key):
+            return
+        image = self._render_image(bot_id=via_key)
+        if image:
+            await self._send_image_to_group(group_id, image)
 
     async def _apply_group_snapshot(self, rows: List[dict]) -> None:
         """应用一轮成功拉取。rows 里每个元素是某个 bot 的群列表。
@@ -658,13 +652,28 @@ class HelpDexPlugin(Star):
                 )
                 self._known_by_bot[key] = current
                 continue
-            departed = prev - current
-            if departed:
-                for gid in departed:
-                    self._forget_group(gid)
-                self._save_seen_groups()
             arrived = current - prev
-            self._known_by_bot[key] = current
+            still_known = set(prev)
+            # 上一轮在、这一轮不在：先记为「疑似退出」。单轮缺失多半是这次
+            # 拉取返回不全，立刻忘记去重状态会让群再出现时重发欢迎；
+            # 连续 GROUP_LEAVE_STREAK 轮都不在，才当真的离开了。
+            for gid in prev - current:
+                pair = (key, gid)
+                streak = self._missing_rounds.get(pair, 0) + 1
+                if streak >= GROUP_LEAVE_STREAK:
+                    self._missing_rounds.pop(pair, None)
+                    still_known.discard(gid)
+                    self._forget_group(gid)
+                    self._save_seen_groups()
+                    logger.info(
+                        f"[help_dex] 群 {gid} 连续 {streak} 轮不在 bot {key} 列表里，按退出清理"
+                    )
+                else:
+                    self._missing_rounds[pair] = streak
+            for gid in current:
+                self._missing_rounds.pop((key, gid), None)
+            # 疑似退出的群先留在已知集合里：这样它下一轮若回来，不算「新入群」。
+            self._known_by_bot[key] = still_known | current
             for gid in sorted(arrived):
                 await self._on_group_appeared(gid, via_key=key)
         fresh = {row["key"] for row in rows}
@@ -692,7 +701,6 @@ class HelpDexPlugin(Star):
                 rows = await self._fetch_groups_per_instance()
                 if rows:
                     await self._apply_group_snapshot(rows)
-                await self._flush_pending_links()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -703,6 +711,8 @@ class HelpDexPlugin(Star):
         self._seen_groups.discard(group_id)
         self._fired_groups.discard(group_id)
         self._quiet.pop(group_id, None)
+        for pair in [p for p in self._missing_rounds if p[1] == group_id]:
+            self._missing_rounds.pop(pair, None)
 
     def _forget_bot_left(self, event: AstrMessageEvent) -> None:
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
@@ -865,7 +875,6 @@ class HelpDexPlugin(Star):
 
         不回写的话：入群发的还是旧地址，而旧地址已经作废。
         临时隧道本来就每次重开都换地址，这里就是它“链接能不能用”的关键一环。
-        顺带把之前没发成链接的群补上（隧道就绪 = 现在能发了）。
         """
         if not url:
             return
@@ -876,8 +885,6 @@ class HelpDexPlugin(Star):
             self._probe_ok = None
             self._probed_at = 0.0
             logger.info(f"[help_dex] 隧道地址已更新并写回配置：{url}")
-        if self._pending_link:
-            asyncio.create_task(self._flush_pending_links())
 
     async def _resolve_link(self, group_id: str = "", force: bool = False) -> Optional[str]:
         link = self._public_link(group_id)
@@ -1021,7 +1028,11 @@ class HelpDexPlugin(Star):
         except (TypeError, ValueError):
             seconds = 60
         if seconds > 0:
-            self._quiet[group_id] = time.time() + seconds
+            now = time.time()
+            # 顺手清掉过期的，不然没人查的群条目会一直留着
+            for gid in [g for g, deadline in self._quiet.items() if deadline <= now]:
+                self._quiet.pop(gid, None)
+            self._quiet[group_id] = now + seconds
 
     def _quiet_left(self, group_id: str) -> float:
         deadline = self._quiet.get(group_id, 0.0)
@@ -1064,13 +1075,10 @@ class HelpDexPlugin(Star):
         via_key = str(event.get_self_id() or "").strip() or None
         if await self._deliver_welcome(group_id, via_key=via_key):
             return
-        # 链接还没就绪：已登记待补发（轮询和隧道就绪时都会自动补），
-        # 同时先把图鉴图片发出去，不让人干等。
+        # 链接不可用：直接发图鉴兜底，不登记、不重试。
         image = self._render_image(bot_id=self._bot_id_for(event))
         if image:
             await self._announce(event, None, image)
-        else:
-            await self._announce(event, LINK_PENDING_TEXT)
 
     @staticmethod
     async def _announce(event: AstrMessageEvent, text: Optional[str] = None,
@@ -1208,11 +1216,15 @@ class HelpDexPlugin(Star):
             arg = arg[len("全局"):].strip() if arg.startswith("全局") else arg[len("默认"):].strip()
         elif arg.startswith("重置"):
             pass  # 上面的精确匹配已经处理了
-        source, error = await self._resolve_image_source(event, arg, "图鉴背景")
+        source, error, temp = await self._resolve_image_source(event, arg, "图鉴背景")
         if error:
             yield event.plain_result(error)
             return
-        error = self.style.set_background(source, bot_id=target_bot)
+        try:
+            error = self.style.set_background(source, bot_id=target_bot)
+        finally:
+            if temp:
+                _discard_temp(source)
         if error:
             yield event.plain_result(f"❌ {error}")
             return
@@ -1237,11 +1249,15 @@ class HelpDexPlugin(Star):
             self.style.clear_logo()
             yield event.plain_result("✅ Logo 已移除。")
             return
-        source, error = await self._resolve_image_source(event, arg, "图鉴logo")
+        source, error, temp = await self._resolve_image_source(event, arg, "图鉴logo")
         if error:
             yield event.plain_result(error)
             return
-        error = self.style.set_logo(source)
+        try:
+            error = self.style.set_logo(source)
+        finally:
+            if temp:
+                _discard_temp(source)
         if error:
             yield event.plain_result(f"❌ {error}")
             return
@@ -1764,9 +1780,6 @@ class HelpDexPlugin(Star):
         ))
         base = self._base_url()
         lines.append("对外地址：{}".format(base or "❌ 没配（会退回发图鉴，不发死链）"))
-        if self._pending_link:
-            lines.append("待补发：{}（链接恢复后自动补）".format(
-                "、".join(sorted(self._pending_link)[:8])))
 
         lines.append("")
         lines.append("【检测】")
@@ -1847,8 +1860,11 @@ class HelpDexPlugin(Star):
     # -------------------- 图片来源 --------------------
     async def _resolve_image_source(
         self, event: AstrMessageEvent, arg: str, command_name: str
-    ) -> Tuple[Optional[str], Optional[str]]:
-        """返回 (图片本地路径, 错误提示)，两者互斥。"""
+    ) -> Tuple[Optional[str], Optional[str], bool]:
+        """返回 (图片本地路径, 错误提示, 是否为临时文件)，前两者互斥。
+
+        第三项为 True 表示路径是本插件下载到临时目录的，调用方用完要删掉。
+        """
         for comp in _image_components(event):
             try:
                 path = await comp.convert_to_file_path()
@@ -1856,15 +1872,15 @@ class HelpDexPlugin(Star):
                 logger.warning(f"[help_dex] 图片转存失败: {exc}")
                 continue
             if path and os.path.isfile(path):
-                return str(path), None
+                return str(path), None, False
         url_match = _URL_RE.search(arg)
         if url_match:
             url = url_match.group(0).rstrip("，。！？!?,.")
             downloaded = await self._download_image(url)
             if downloaded:
-                return downloaded, None
-            return None, "❌ 图片下载失败，请检查链接（限 http/https，不超过 20MB）。"
-        return None, NO_IMAGE_TIP.format(command_name)
+                return downloaded, None, True
+            return None, "❌ 图片下载失败，请检查链接（限 http/https，不超过 20MB）。", False
+        return None, NO_IMAGE_TIP.format(command_name), False
 
     async def _download_image(self, url: str) -> Optional[str]:
         try:
